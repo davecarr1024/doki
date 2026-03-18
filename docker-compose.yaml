@@ -1,0 +1,91 @@
+name: doki
+
+networks:
+  doki-net:
+    driver: bridge
+
+services:
+  coordinator:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.coordinator
+    image: doki-coordinator:latest
+    container_name: doki-coordinator
+    networks:
+      - doki-net
+    ports:
+      - "7000:7000"
+    volumes:
+      - ./config/coordinator.yaml:/config/coordinator.yaml:ro
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:7000/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 2s
+
+  node-a:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    image: doki-node:latest
+    container_name: doki-node-a
+    networks:
+      - doki-net
+    ports:
+      - "8001:8000"
+    volumes:
+      - ./config/node-a.yaml:/config/node.yaml:ro
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  node-b:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    image: doki-node:latest
+    container_name: doki-node-b
+    networks:
+      - doki-net
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./config/node-b.yaml:/config/node.yaml:ro
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
+  node-c:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.node
+    image: doki-node:latest
+    container_name: doki-node-c
+    networks:
+      - doki-net
+    ports:
+      - "8003:8000"
+    volumes:
+      - ./config/node-c.yaml:/config/node.yaml:ro
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8000/ready"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 3s

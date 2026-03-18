@@ -1,0 +1,86 @@
+syntax = "proto3";
+
+package doki.coordinator.v1;
+
+import "common.proto";
+
+option go_package = "github.com/davecarr1024/doki/gen/proto/coordinator/v1;coordinatorv1";
+
+// CoordinatorService is the control-plane API.
+//
+// Nodes call this service to:
+//   - report liveness (Heartbeat)
+//   - fetch routing info (GetShardMap, WhereIsLeader)
+//
+// Clients call this service to:
+//   - fetch routing info (GetShardMap, WhereIsLeader)
+//
+// The coordinator calls nodes via NodeService (see node.proto).
+service CoordinatorService {
+  // Heartbeat signals that a node is alive. Nodes call this periodically.
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // GetShardMap returns the current shard map. Cached by clients and nodes.
+  rpc GetShardMap(GetShardMapRequest) returns (GetShardMapResponse);
+
+  // WhereIsLeader returns the current leader node ID for a shard.
+  rpc WhereIsLeader(WhereIsLeaderRequest) returns (WhereIsLeaderResponse);
+
+  // GetStatus returns a full cluster health summary.
+  rpc GetStatus(GetStatusRequest) returns (CoordinatorStatus);
+}
+
+// --- Heartbeat ---
+
+message ShardHeartbeat {
+  string shard_id = 1;
+  string role = 2;    // "LEADER" or "FOLLOWER"
+  uint64 term = 3;
+  uint64 version = 4;
+  bool is_ready = 5;
+}
+
+message HeartbeatRequest {
+  string node_id = 1;
+  repeated ShardHeartbeat shards = 2;
+}
+
+message HeartbeatResponse {
+  // Reserved for future use (e.g., coordinator push of new shard map version)
+  uint64 shard_map_version = 1;
+}
+
+// --- Shard Map ---
+
+message GetShardMapRequest {}
+
+message GetShardMapResponse {
+  doki.common.v1.ShardMap shard_map = 1;
+}
+
+// --- Leader query ---
+
+message WhereIsLeaderRequest {
+  string shard_id = 1;
+}
+
+message WhereIsLeaderResponse {
+  string leader_node_id = 1;
+}
+
+// --- Status ---
+
+message GetStatusRequest {}
+
+message NodeHealthEntry {
+  string node_id = 1;
+  string address = 2;
+  bool is_alive = 3;
+  int64 last_heartbeat_ms = 4;  // milliseconds since last heartbeat; -1 if never
+}
+
+message CoordinatorStatus {
+  uint64 shard_map_version = 1;
+  repeated NodeHealthEntry nodes = 2;
+  repeated doki.common.v1.ShardInfo shards = 3;
+}

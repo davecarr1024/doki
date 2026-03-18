@@ -99,15 +99,21 @@ Clients are the external interface. In v1 they:
 
 ### Topology Example
 
-```
-Coordinator
-  - Shard 0 → leader: A, followers: B, C
-  - Shard 1 → leader: B, followers: C, D
+```mermaid
+graph TB
+    CO[Coordinator<br/>Shard 0 → leader: A<br/>Shard 1 → leader: B]
 
-Node A: hosts Shard 0 (leader)
-Node B: hosts Shard 0 (follower), Shard 1 (leader)
-Node C: hosts Shard 0 (follower), Shard 1 (follower)
-Node D: hosts Shard 1 (follower)
+    NA[Node A<br/>Shard 0: LEADER]
+    NB[Node B<br/>Shard 0: FOLLOWER<br/>Shard 1: LEADER]
+    NC[Node C<br/>Shard 0: FOLLOWER<br/>Shard 1: FOLLOWER]
+    ND[Node D<br/>Shard 1: FOLLOWER]
+
+    CO -- assigns --> NA
+    CO -- assigns --> NB
+    NA -- replicates --> NB
+    NA -- replicates --> NC
+    NB -- replicates --> NC
+    NB -- replicates --> ND
 ```
 
 ---
@@ -295,23 +301,25 @@ A replica is **not ready** (`is_ready = false`) when it is recovering — i.e., 
 
 ### Happy Path
 
-```
-Client → Leader: Put(shard_id, key, value)
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant L as Leader
+    participant F1 as Follower 1
+    participant F2 as Follower 2
 
-Leader:
-  1. Check: am I still leader? (check term)
-  2. Increment version: version++
-  3. Create replication payload: ReplicateRequest{term, version, op: Put(key, value)}
-  4. Send ReplicateRequest to all followers in parallel
-  5. Wait for ACK from quorum (majority, including self)
-  6. Apply write to local kv store
-  7. Return success to client
-
-Follower (on receiving ReplicateRequest):
-  1. Check: is term >= my term?
-  2. Apply op to local kv store
-  3. Update version
-  4. Return ACK to leader
+    C->>L: Put(shard_id, key, value)
+    note over L: 1. check am I still leader?<br/>2. version++<br/>3. build ReplicateRequest
+    par replicate in parallel
+        L->>F1: Replicate(term, version, Put(key,value))
+        L->>F2: Replicate(term, version, Put(key,value))
+    end
+    F1->>F1: check term ≥ my term<br/>apply op<br/>update version
+    F1-->>L: ACK
+    F2->>F2: check term ≥ my term<br/>apply op<br/>update version
+    F2-->>L: ACK
+    note over L: quorum reached<br/>apply locally
+    L-->>C: OK
 ```
 
 ### Quorum Counting
@@ -421,19 +429,24 @@ A replica enters recovery when:
 
 ### Recovery Protocol
 
-```
-Recovering node → Coordinator: WhereIsLeader(shard_id)
-Coordinator → Node: leader_id
+```mermaid
+sequenceDiagram
+    participant R as Recovering Node
+    participant CO as Coordinator
+    participant L as Leader
 
-Node → Leader: SyncRequest{shard_id}
-Leader → Node: FullStateSnapshot{term, version, kv_map}
+    R->>CO: WhereIsLeader(shard_id)
+    CO-->>R: leader_id = "node-a"
 
-Node:
-  1. Replace local kv store with snapshot kv_map
-  2. Set version = snapshot.version
-  3. Set term = snapshot.term
-  4. Set is_ready = true
-  5. Begin accepting replication messages
+    R->>L: SyncRequest(shard_id)
+    loop stream chunks
+        L-->>R: SnapshotChunk{term, version, entries[]}
+    end
+    L-->>R: SnapshotChunk{is_last=true}
+
+    note over R: 1. replace kv store with snapshot<br/>2. version = snapshot.version<br/>3. term = snapshot.term<br/>4. is_ready = true
+
+    note over R: apply buffered writes (version > snapshot.version)
 ```
 
 ### Consistency of Snapshot

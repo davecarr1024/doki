@@ -6,36 +6,32 @@ This document describes the component structure, interfaces, deployment topology
 
 ## Component Overview
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Doki Cluster                            │
-│                                                                 │
-│  ┌──────────────────────────────────────────────────────────┐  │
-│  │                      Coordinator                          │  │
-│  │                                                          │  │
-│  │  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  │  │
-│  │  │  Membership  │  │  Shard Map   │  │   Leader Mgr  │  │  │
-│  │  └──────────────┘  └──────────────┘  └───────────────┘  │  │
-│  │  ┌──────────────┐  ┌──────────────┐                     │  │
-│  │  │  Health Mon  │  │  Routing API │                     │  │
-│  │  └──────────────┘  └──────────────┘                     │  │
-│  └──────────────────────────────────────────────────────────┘  │
-│                                                                 │
-│  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐   │
-│  │    Node A      │  │    Node B      │  │    Node C      │   │
-│  │                │  │                │  │                │   │
-│  │ Shard 0 LEADER │  │ Shard 0 FLWR   │  │ Shard 0 FLWR   │   │
-│  │                │  │ Shard 1 LEADER │  │ Shard 1 FLWR   │   │
-│  │ ┌────────────┐ │  │ ┌────────────┐ │  │ ┌────────────┐ │   │
-│  │ │  Shard     │ │  │ │  Shard     │ │  │ │  Shard     │ │   │
-│  │ │  Manager   │ │  │ │  Manager   │ │  │ │  Manager   │ │   │
-│  │ └────────────┘ │  │ └────────────┘ │  │ └────────────┘ │   │
-│  │ ┌────────────┐ │  │ ┌────────────┐ │  │ ┌────────────┐ │   │
-│  │ │  Storage   │ │  │ │  Storage   │ │  │ │  Storage   │ │   │
-│  │ └────────────┘ │  │ └────────────┘ │  │ └────────────┘ │   │
-│  └────────────────┘  └────────────────┘  └────────────────┘   │
-│                                                                 │
-└─────────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph Cluster
+        subgraph CP["Control Plane"]
+            CO[Coordinator<br/>membership · shard map · leader assignment]
+        end
+
+        subgraph DP["Data Plane"]
+            NA[Node A<br/>Shard 0: LEADER<br/>Shard 1: FOLLOWER]
+            NB[Node B<br/>Shard 0: FOLLOWER<br/>Shard 1: LEADER]
+            NC[Node C<br/>Shard 0: FOLLOWER<br/>Shard 1: FOLLOWER]
+        end
+    end
+
+    CL[Client]
+
+    CL -- "routing queries" --> CO
+    CL -- "reads / writes" --> NA
+    NA -- "heartbeat" --> CO
+    NB -- "heartbeat" --> CO
+    NC -- "heartbeat" --> CO
+    CO -- "assign leader" --> NA
+    CO -- "set follower" --> NB
+    CO -- "set follower" --> NC
+    NA -- "replicate" --> NB
+    NA -- "replicate" --> NC
 ```
 
 ---
@@ -44,175 +40,163 @@ This document describes the component structure, interfaces, deployment topology
 
 ```
 doki/
-├── coordinator/          # Coordinator process
-│   ├── main.go
-│   ├── server.go         # gRPC server
-│   ├── membership.go     # Node registry, heartbeat tracking
-│   ├── shard_map.go      # Shard map state and versioning
-│   ├── leader_manager.go # Leader assignment logic
-│   └── health_monitor.go # Failure detection
-│
-├── node/                 # Leaf node process
-│   ├── main.go
-│   ├── server.go         # gRPC server (client-facing + replication)
-│   ├── shard_manager.go  # Per-shard replica state management
-│   ├── replicator.go     # Leader-side replication logic
-│   ├── recovery.go       # Follower recovery / snapshot application
-│   └── storage/
-│       ├── storage.go    # Storage interface
-│       └── memory.go     # In-memory implementation
-│
-├── proto/                # Protobuf definitions
+├── cmd/
+│   ├── coordinator/          # Entry point: coordinator binary
+│   └── node/                 # Entry point: node binary
+├── coordinator/              # Coordinator library
+│   ├── membership.go         # Node registry, heartbeat tracking
+│   ├── leader.go             # Leader assignment logic
+│   └── server.go             # HTTP server + handlers
+├── node/                     # Node library
+│   ├── replica.go            # Per-shard ReplicaState
+│   └── server.go             # HTTP server + handlers, heartbeat loop
+├── internal/
+│   ├── clock/                # Clock interface (real + fake)
+│   ├── config/               # Config types and YAML loading
+│   ├── shardmap/             # ShardMap types and operations
+│   └── storage/              # Storage interface + implementations
+│       └── memory/           # In-memory storage engine (v1)
+├── test/
+│   └── integration/          # End-to-end tests (real servers, no Docker)
+├── proto/                    # Protobuf definitions (gRPC, Phase 1+)
+│   ├── common.proto
 │   ├── coordinator.proto
-│   ├── node.proto
-│   └── common.proto
-│
-├── client/               # Client library
-│   ├── client.go         # High-level client API
-│   └── routing.go        # Shard map cache + routing
-│
-├── config/               # Config loading and types
-│   ├── coordinator.yaml
-│   └── node.yaml
-│
-├── test/                 # Integration tests
-│   ├── cluster/          # Test cluster helpers (Testcontainers)
-│   ├── scenarios/        # Test scenarios (failover, recovery, etc.)
-│   └── assertions/       # Invariant checks
-│
-└── docker/
-    ├── Dockerfile.coordinator
-    ├── Dockerfile.node
-    └── docker-compose.yaml
+│   └── node.proto
+├── config/                   # Example YAML configs
+└── docker/                   # Dockerfiles + docker-compose
 ```
-
-> **Language choice:** The module structure above uses Go conventions. Go is a natural fit: strong standard library for networking, gRPC support, simple concurrency model, and easy cross-compilation for Docker. An equivalent structure applies if using C++ or Rust.
 
 ---
 
 ## Component Interfaces
 
-### Coordinator → Node
+### Coordinator → Node (Phase 1+, gRPC)
 
-The coordinator pushes control messages to nodes when leadership changes.
+```mermaid
+sequenceDiagram
+    participant C as Coordinator
+    participant N as Node
 
-```
-// Coordinator tells a node it is now the leader for a shard
-AssignLeader(shard_id, term) → OK | Error
+    C->>N: AssignLeader(shard_id, term)
+    N-->>C: OK
 
-// Coordinator tells a node who the leader is for a shard
-SetFollower(shard_id, leader_id, term) → OK | Error
-```
-
-### Node → Coordinator
-
-Nodes push heartbeats and pull routing information.
-
-```
-// Node signals liveness
-Heartbeat(node_id, shard_statuses[]) → OK
-
-// Node queries routing
-GetShardMap() → ShardMap
-WhereIsLeader(shard_id) → NodeId
+    C->>N: SetFollower(shard_id, leader_id, term)
+    N-->>C: OK
 ```
 
-### Client → Node
+### Node → Coordinator (HTTP, Phase 0; gRPC, Phase 1+)
 
-Clients issue data operations to nodes (ideally leaders).
+```mermaid
+sequenceDiagram
+    participant N as Node
+    participant C as Coordinator
 
-```
-Put(shard_id, key, value) → OK | NOT_LEADER(hint) | QUORUM_UNAVAILABLE | Error
-Get(shard_id, key) → value | NOT_FOUND | NOT_LEADER(hint) | Error
-Delete(shard_id, key) → OK | NOT_LEADER(hint) | QUORUM_UNAVAILABLE | Error
-```
+    loop every heartbeat_interval
+        N->>C: POST /heartbeat {node_id, shards[]}
+        C-->>N: 200 OK
+    end
 
-### Leader → Follower (Replication)
-
-Leaders push replication messages to followers.
-
-```
-Replicate(shard_id, term, version, op) → ACK | TERM_MISMATCH(my_term) | Error
-SyncState(shard_id) → stream SnapshotChunk
-```
-
-### Client → Coordinator
-
-Clients query routing metadata.
-
-```
-GetShardMap() → ShardMap
-WhereIsLeader(shard_id) → NodeId
+    N->>C: GET /shardmap
+    C-->>N: ShardMap{version, shards[]}
 ```
 
 ---
 
 ## Data Flow: Write Path
 
-```
-Client
-  │
-  │ Put(key, value)
-  ▼
-Node (Leader for shard)
-  │
-  ├──────────────────────────────────────────┐
-  │ Replicate(term, version, Put(key,value)) │
-  ▼                                          ▼
-Follower 1                             Follower 2
-  │ ACK                                  │ ACK
-  └──────────────────────────────────────┘
-                    │
-              (quorum reached)
-                    │
-                    ▼
-             Apply to local kv
-                    │
-                    ▼
-              Return OK to Client
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant L as Leader (Node A)
+    participant F1 as Follower (Node B)
+    participant F2 as Follower (Node C)
+
+    CL->>L: Put(shard_id, key, value)
+    L->>L: version++
+    par Replicate in parallel
+        L->>F1: Replicate(term, version, Put(key,value))
+        L->>F2: Replicate(term, version, Put(key,value))
+    end
+    F1-->>L: ACK
+    F2-->>L: ACK
+    note over L: quorum reached (2/3)
+    L->>L: apply to local KV
+    L-->>CL: OK
 ```
 
 ---
 
 ## Data Flow: Read Path
 
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant L as Leader (Node A)
+
+    CL->>L: Get(shard_id, key)
+    L->>L: read from local KV
+    L-->>CL: value
 ```
-Client
-  │
-  │ Get(key)
-  ▼
-Node (Leader for shard)
-  │
-  │ (read from local kv, no replication needed)
-  │
-  └──▶ Return value to Client
+
+If the client reaches a follower by mistake:
+
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant F as Follower (Node B)
+    participant L as Leader (Node A)
+
+    CL->>F: Get(shard_id, key)
+    F-->>CL: NOT_LEADER {leader_hint: "node-a"}
+    CL->>L: Get(shard_id, key)
+    L-->>CL: value
 ```
 
 ---
 
 ## Data Flow: Recovery
 
+```mermaid
+sequenceDiagram
+    participant R as Recovering Node
+    participant CO as Coordinator
+    participant L as Leader
+
+    R->>CO: GET /shardmap
+    CO-->>R: ShardMap (leader = "node-a")
+
+    R->>L: SyncState(shard_id)
+    loop stream chunks
+        L-->>R: SnapshotChunk{term, version, entries[]}
+    end
+    note over R: apply snapshot atomically
+    R->>R: is_ready = true
+    loop apply buffered writes
+        L->>R: Replicate(version > snapshot.version)
+    end
 ```
-Recovering Node
-  │
-  │ WhereIsLeader(shard_id)
-  ▼
-Coordinator
-  │ leader_id = "node-a"
-  ▼
-Recovering Node
-  │
-  │ SyncState(shard_id)
-  ▼
-Leader (node-a)
-  │
-  │ stream SnapshotChunk{term, version, kv_map}
-  ▼
-Recovering Node
-  │ Replace local state with snapshot
-  │ Set version, term
-  │ Mark is_ready = true
-  └──▶ Begin accepting replication messages
+
+---
+
+## Replica State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> NOT_READY : node starts / restarts
+
+    NOT_READY --> READY : snapshot received and applied
+
+    READY --> READY : Replicate(version = v+1) received; apply + ACK
+
+    READY --> NOT_READY : gap detected (version != v+1)\nOR lag > max_lag_versions\n→ trigger recovery
+
+    READY --> LEADER : AssignLeader received from coordinator
+
+    LEADER --> FOLLOWER : TERM_MISMATCH received\n(stale leader detected)
+
+    LEADER --> LEADER : write committed; Replicate sent to followers
+
+    FOLLOWER --> LEADER : AssignLeader received (new election)
 ```
 
 ---
@@ -221,32 +205,48 @@ Recovering Node
 
 ### Docker Compose (Development)
 
-```
-┌──────────────────────────────────────────────────┐
-│                  docker network: doki             │
-│                                                  │
-│  coordinator:7000                                │
-│                                                  │
-│  node-a:8000                                     │
-│  node-b:8000                                     │
-│  node-c:8000                                     │
-│  node-d:8000  (optional)                         │
-│                                                  │
-└──────────────────────────────────────────────────┘
-```
+```mermaid
+graph LR
+    subgraph docker-network["Docker Network: doki-net"]
+        CO["coordinator<br/>:7000"]
+        NA["node-a<br/>:8001"]
+        NB["node-b<br/>:8002"]
+        NC["node-c<br/>:8003"]
+    end
 
-Each component runs in its own container. DNS resolution is by container name. The coordinator starts first; nodes connect to it on startup.
+    EX["External / tests"] -- "7000" --> CO
+    EX -- "8001" --> NA
+    EX -- "8002" --> NB
+    EX -- "8003" --> NC
+
+    NA -- heartbeat --> CO
+    NB -- heartbeat --> CO
+    NC -- heartbeat --> CO
+```
 
 ### Startup Order
 
-1. Start coordinator
-2. Start nodes (they heartbeat in to coordinator)
-3. Coordinator assigns initial leaders once all expected nodes are healthy
-4. Cluster is ready
+```mermaid
+sequenceDiagram
+    participant D as docker compose
+    participant CO as Coordinator
+    participant N as Nodes
 
-### Integration Test Topology (Testcontainers)
+    D->>CO: start
+    CO->>CO: load config, init shard map
+    CO->>CO: start health monitor
+    note over CO: ready
 
-Tests programmatically create and destroy a cluster. Each test starts fresh. Nodes can be killed and restarted. Network partitions are simulated via a proxy layer.
+    D->>N: start (depends_on: coordinator healthy)
+    N->>CO: GET /shardmap
+    CO-->>N: ShardMap
+    N->>N: init replica state for each shard
+    N->>N: mark shards ready (Phase 0)
+    note over N: ready
+    loop every 500ms
+        N->>CO: POST /heartbeat
+    end
+```
 
 ---
 
@@ -254,39 +254,34 @@ Tests programmatically create and destroy a cluster. Each test starts fresh. Nod
 
 ### Node Startup
 
-```
-1. Load config (node_id, coordinator address, shard assignments)
-2. Initialize storage engine for each shard
-3. Start gRPC server
-4. Send initial heartbeat to coordinator
-5. For each shard:
-   a. Mark shard as NOT_READY
-   b. Request recovery from leader (SyncState)
-   c. Apply snapshot
-   d. Mark shard as READY
-6. Begin serving traffic
+```mermaid
+flowchart TD
+    A[Load config] --> B[Fetch shard map from coordinator]
+    B --> C[InitShards: create ReplicaState per shard]
+    C --> D{Phase 0?}
+    D -- yes --> E[Mark all shards is_ready=true]
+    D -- no --> F[Request snapshot from leader\nMark is_ready=false]
+    F --> G[Apply snapshot\nMark is_ready=true]
+    E --> H[Start HTTP server]
+    G --> H
+    H --> I[Start heartbeat goroutine]
+    I --> J[Serve traffic]
 ```
 
 ### Coordinator Startup
 
+```mermaid
+flowchart TD
+    A[Load config] --> B[Build shard map from ShardSpec list]
+    B --> C[Assign initial leaders from config]
+    C --> D[Start HTTP server]
+    D --> E[Start health monitor goroutine]
+    E --> F{node heartbeat received?}
+    F -- yes --> G[Record timestamp]
+    G --> F
+    F -- timeout --> H[Mark node dead\nReassign leader if needed]
+    H --> F
 ```
-1. Load config (nodes, shards, initial leaders)
-2. Start gRPC server
-3. Start heartbeat monitor
-4. Wait for nodes to check in (or proceed with config defaults)
-5. Assign initial leaders
-6. Serve routing queries
-```
-
-### Graceful Shutdown
-
-A graceful shutdown:
-1. Stops accepting new client requests
-2. Completes in-flight writes
-3. Notifies coordinator (optional in v1)
-4. Exits
-
-Ungraceful shutdown (crash): the coordinator detects via missed heartbeat.
 
 ---
 
@@ -309,24 +304,23 @@ Ungraceful shutdown (crash): the coordinator detects via missed heartbeat.
 
 ### Per-Node
 
-Each node runs:
-- One gRPC server (handles all inbound RPC calls, dispatches to handlers)
-- One goroutine (or thread) per shard for replication
-- One heartbeat goroutine
+```mermaid
+graph LR
+    GS[gRPC/HTTP Server goroutine] --> |dispatch| SH[Shard handlers]
+    SH --> |per-shard lock| RS[ReplicaState]
+    HR[Heartbeat goroutine] --> CO[Coordinator]
+    RP[Replication goroutines\none per follower] --> FN[Follower nodes]
+    RS --> KV[Storage engine]
+```
 
-All access to a shard's `ReplicaState` is serialized through a per-shard mutex. There is no shared mutable state between shards.
+Each shard's `ReplicaState` is protected by its own `sync.RWMutex`. No shard lock is ever held while acquiring another shard's lock.
 
-### Per-Coordinator
-
-The coordinator runs:
-- One gRPC server
-- One heartbeat check goroutine (periodic, default 500ms tick)
-- All state access is serialized through a single coordinator mutex (simple, acceptable for v1)
+The coordinator uses a single `sync.RWMutex` for its state — acceptable in v1.
 
 ---
 
 ## Security (v1: None)
 
-v1 has no authentication, authorization, or encryption. All traffic is plaintext gRPC. This is acceptable for a local development and learning environment.
+v1 has no authentication, authorization, or encryption. All traffic is plaintext HTTP/JSON (Phase 0) or plaintext gRPC (Phase 1+). This is acceptable for a local development and learning environment.
 
 Future: mTLS for node-to-node communication; token-based auth for clients.

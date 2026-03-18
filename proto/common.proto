@@ -1,0 +1,37 @@
+syntax = "proto3";
+
+package doki.common.v1;
+
+option go_package = "github.com/davecarr1024/doki/gen/proto/common/v1;commonv1";
+
+// Operation represents a single write operation applied to a shard's KV store.
+message Operation {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_PUT = 1;
+    TYPE_DELETE = 2;
+  }
+
+  Type type = 1;
+  bytes key = 2;
+  bytes value = 3;  // empty for DELETE
+}
+
+// KVEntry is a single key-value pair, used in snapshots.
+message KVEntry {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// ShardInfo describes a shard: its ID, replicas, and current leader.
+message ShardInfo {
+  string shard_id = 1;
+  repeated string replicas = 2;
+  string leader = 3;
+}
+
+// ShardMap is the versioned cluster routing table.
+message ShardMap {
+  uint64 version = 1;
+  repeated ShardInfo shards = 2;
+}

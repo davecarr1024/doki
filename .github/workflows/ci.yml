@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  test:
+    name: Build & Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Verify module consistency
+        run: go mod verify
+
+      - name: Build
+        run: go build ./...
+
+      - name: Unit tests
+        run: go test ./... -count=1 -timeout=60s -race
+
+      - name: Integration tests
+        run: go test ./test/integration/... -tags=integration -count=1 -timeout=120s -v
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.23"
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+  proto-lint:
+    name: Proto Lint
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up buf
+        uses: bufbuild/buf-action@v1
+        with:
+          version: "1.47.2"
+          push: false
+
+      - name: Lint proto files
+        run: buf lint

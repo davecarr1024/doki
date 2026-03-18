@@ -184,85 +184,492 @@ Do not start the next phase until the current phase is solid.
 
 ---
 
-## Phase 6: Basic SQL Layer
+## Phase 6: SQL — Lexer, Parser, and Schema
 
-**Theme:** A real query language on top of the KV engine.
+**Theme:** Turn SQL text into a structured representation the system can work with.
 
 **New Concepts:**
-- SQL parsing
-- Query planning
-- Schema management
+- Lexical analysis (tokenization)
+- Recursive descent parsing
+- Abstract Syntax Tree (AST)
+- Schema management (catalog)
 - Table-to-shard mapping
 
-**What Gets Built:**
-- SQL parser (single-table subset: SELECT, INSERT, UPDATE, DELETE)
-- Schema registry (table definitions, primary key mapping)
-- Query planner: SQL → KV operation sequence
-- Executor: run KV operations
-- Primary-key-only access; no secondary indexes
+### SQL Compiler Pipeline
 
-**Supported SQL (v1):**
-```sql
-CREATE TABLE users (id INT PRIMARY KEY, name TEXT, age INT);
-INSERT INTO users VALUES (1, 'alice', 30);
-SELECT * FROM users WHERE id = 1;
-UPDATE users SET age = 31 WHERE id = 1;
-DELETE FROM users WHERE id = 1;
+```mermaid
+flowchart LR
+    SQL["SQL text"] --> LEX[Lexer<br/>tokens]
+    LEX --> PAR[Parser<br/>AST]
+    PAR --> ANA[Analyzer<br/>resolved AST]
+    ANA --> PLN[Planner<br/>logical plan]
+    PLN --> OPT[Optimizer<br/>optimized plan]
+    OPT --> EXE[Executor<br/>results]
+    EXE --> KV[KV Engine]
 ```
 
-**Not Supported:**
-- Range scans
-- JOINs
-- Multi-row transactions
-- Secondary indexes
-- Multi-shard queries
+### Lexer
 
-**Key Invariants to Test:**
-- SQL INSERT/SELECT round-trip
-- SQL UPDATE produces correct new state
-- SQL DELETE removes the row
-- Invalid SQL returns a useful error
+The lexer converts raw SQL text into a flat stream of tokens:
+
+```
+Token types:
+  KEYWORD    SELECT, INSERT, UPDATE, DELETE, CREATE, TABLE, FROM,
+             WHERE, INTO, VALUES, SET, PRIMARY, KEY, INT, TEXT, BOOL
+  IDENT      user-defined names (table names, column names)
+  NUMBER     integer or float literal
+  STRING     quoted string literal
+  PUNCT      ( ) , ; = != < > <= >=
+  EOF
+```
+
+The lexer is a simple hand-written scanner. It processes the input character by character, skipping whitespace and comments, and emits tokens.
+
+### Parser
+
+The parser builds an **Abstract Syntax Tree (AST)** from the token stream using recursive descent.
+
+Each SQL statement is one AST node type:
+
+```go
+type Statement interface{ statementNode() }
+
+type CreateTableStmt struct {
+    TableName string
+    Columns   []ColumnDef
+}
+
+type InsertStmt struct {
+    TableName string
+    Columns   []string   // optional explicit column list
+    Values    []Expr
+}
+
+type SelectStmt struct {
+    Columns   []Expr     // * or specific columns
+    TableName string
+    Where     Expr       // may be nil
+}
+
+type UpdateStmt struct {
+    TableName  string
+    Assignments []Assignment  // col = expr
+    Where       Expr
+}
+
+type DeleteStmt struct {
+    TableName string
+    Where     Expr
+}
+```
+
+Expressions:
+
+```go
+type Expr interface{ exprNode() }
+
+type BinaryExpr struct { Left Expr; Op string; Right Expr }
+type ColumnRef  struct { Name string }
+type Literal    struct { Value any }   // int, string, bool, nil
+```
+
+**Supported SQL grammar (v1):**
+
+```sql
+-- DDL
+CREATE TABLE <name> (<col> <type> [PRIMARY KEY], ...);
+
+-- DML (primary-key-only WHERE in v1)
+INSERT INTO <table> [(<cols>)] VALUES (<vals>);
+SELECT <cols | *> FROM <table> [WHERE <pk> = <val>];
+UPDATE <table> SET <col> = <val> [, ...] WHERE <pk> = <val>;
+DELETE FROM <table> WHERE <pk> = <val>;
+```
+
+### Schema Catalog
+
+The catalog stores table definitions. It is persisted via the coordinator (stored as a special shard), making schema changes globally visible.
+
+```go
+type Catalog interface {
+    CreateTable(def TableDef) error
+    GetTable(name string) (TableDef, error)
+    ListTables() []TableDef
+}
+
+type TableDef struct {
+    Name       string
+    Columns    []ColumnDef
+    PrimaryKey string   // column name of the PK
+    ShardID    string   // which shard stores this table
+}
+
+type ColumnDef struct {
+    Name     string
+    Type     ColumnType  // INT, TEXT, BOOL
+    NotNull  bool
+}
+```
+
+In v1, each table maps to exactly one shard. No cross-shard tables.
+
+### KV Encoding
+
+Rows are encoded as KV entries:
+
+```
+key:   "<table>/<pk_value>"   e.g. "users/42"
+value: JSON-encoded row       e.g. {"id":42,"name":"alice","age":30}
+```
+
+This encoding is simple to implement and inspect. Row-level encoding (like column-family style) is a future optimization.
 
 **Definition of Done:**
-- A SQL client can create a table, insert rows, and query them back
+- `CREATE TABLE` stores a schema in the catalog
+- `INSERT` encodes a row and calls `Put` on the KV engine
+- `SELECT WHERE pk = ?` calls `Get` and decodes the row
+- `UPDATE WHERE pk = ?` calls `Get` + `Put`
+- `DELETE WHERE pk = ?` calls `Delete`
+- Invalid SQL (syntax error, unknown table, wrong column) returns a descriptive error
 
 ---
 
-## Phase 7: Secondary Indexes
+## Phase 7: SQL — Analyzer and Type System
+
+**Theme:** Validate the AST against the schema; catch errors before execution.
+
+**New Concepts:**
+- Name resolution
+- Type checking
+- Semantic validation
+
+### Analyzer
+
+The analyzer takes a parsed AST and resolves all names and types against the catalog. It produces a **resolved AST** (or a typed AST) where every node knows its type.
+
+```mermaid
+flowchart TD
+    A[Raw AST] --> B[Resolve table names\nagainst catalog]
+    B --> C[Resolve column names\nagainst table schema]
+    C --> D[Infer expression types]
+    D --> E[Check type compatibility\ncol TEXT != int literal]
+    E --> F[Check PK constraints\nWHERE must filter on PK in v1]
+    F --> G[Resolved AST]
+```
+
+**Checks performed:**
+
+| Check | Example error |
+|-------|--------------|
+| Table exists | `relation "orders" does not exist` |
+| Column exists | `column "nmae" does not exist` |
+| Type match | `cannot assign TEXT to INT column "age"` |
+| PK in WHERE | `v1: WHERE must filter on primary key` |
+| INSERT column count | `INSERT has 3 columns but 2 values` |
+| NOT NULL | `null value in column "name" violates not-null constraint` |
+
+---
+
+## Phase 8: SQL — Planner and Optimizer
+
+**Theme:** Convert the resolved AST into an efficient execution plan.
+
+**New Concepts:**
+- Logical plans (relational algebra)
+- Physical plans (concrete operations)
+- Rule-based optimization
+- Plan trees
+
+### Logical Plan
+
+The planner converts the resolved AST into a **logical plan tree** — an operator tree in the style of relational algebra:
+
+```mermaid
+graph TB
+    PR[Projection<br/>columns: id, name]
+    FL[Filter<br/>id = 42]
+    SC[Scan<br/>table: users]
+
+    PR --> FL --> SC
+```
+
+Logical operators:
+
+```go
+type LogicalPlan interface{ logicalPlanNode() }
+
+type Scan       struct { Table TableDef }
+type Filter     struct { Input LogicalPlan; Predicate Expr }
+type Projection struct { Input LogicalPlan; Columns []Expr }
+type Insert     struct { Table TableDef; Values []Expr }
+type Update     struct { Table TableDef; Assignments []Assignment; Filter Expr }
+type Delete     struct { Table TableDef; Filter Expr }
+```
+
+### Optimizer
+
+The optimizer applies rule-based rewrites to the logical plan. In v1, rules are simple:
+
+| Rule | Description |
+|------|-------------|
+| **Predicate pushdown** | Move `Filter` nodes as close to `Scan` as possible |
+| **PK point lookup** | If `Filter` is `pk = literal`, convert `Scan+Filter` to a single `PointGet` |
+| **Projection pushdown** | Only fetch needed columns from storage |
+
+The PK point lookup optimization is critical: it transforms a table scan + filter into a single KV `Get`, which is O(1).
+
+```mermaid
+flowchart LR
+    subgraph before["Before optimization"]
+        direction TB
+        P1[Projection] --> F1[Filter pk=42] --> S1[Scan users]
+    end
+    subgraph after["After optimization"]
+        P2[Projection] --> PG[PointGet users/42]
+    end
+    before -->|optimizer| after
+```
+
+### Physical Plan
+
+The physical planner converts logical plans to **physical plans** that map directly to KV operations:
+
+```go
+type PhysicalPlan interface{ physicalPlanNode() }
+
+type KVGet    struct { Key string; Decode func([]byte) Row }
+type KVPut    struct { Key string; Value []byte }
+type KVDelete struct { Key string }
+type KVScan   struct { Prefix string; Decode func([]byte) Row }  // future
+```
+
+---
+
+## Phase 9: SQL — Executor
+
+**Theme:** Execute physical plans against the KV engine and return results.
+
+**New Concepts:**
+- Volcano/iterator model
+- Row materialization
+- Result encoding
+
+### Executor Model
+
+Doki uses the **volcano (iterator) model**: each physical operator is an iterator with `Open()`, `Next()`, and `Close()` methods.
+
+```go
+type Executor interface {
+    Open() error
+    Next() (Row, error)   // returns (nil, nil) at end
+    Close() error
+}
+```
+
+Operators:
+
+| Operator | Description |
+|----------|-------------|
+| `PointGetExecutor` | Single KV `Get`; returns 0 or 1 rows |
+| `KVScanExecutor` | Prefix scan; returns all matching rows (future) |
+| `FilterExecutor` | Wraps another executor; evaluates predicate per row |
+| `ProjectionExecutor` | Wraps another executor; projects columns |
+| `InsertExecutor` | Encodes row and calls KV `Put` |
+| `UpdateExecutor` | `Get` + mutate + `Put` |
+| `DeleteExecutor` | KV `Delete` |
+
+### Row Representation
+
+```go
+type Row map[string]any   // column name → value
+
+// Encode encodes a row to a JSON byte slice for storage
+func Encode(row Row) ([]byte, error)
+
+// Decode decodes a stored byte slice back to a Row
+func Decode(data []byte) (Row, error)
+```
+
+### Result Set
+
+```go
+type ResultSet struct {
+    Columns []string
+    Rows    []Row
+    // For INSERT/UPDATE/DELETE:
+    RowsAffected int
+}
+```
+
+### End-to-End Flow
+
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant SQ as SQL Engine
+    participant KV as KV Layer
+    participant SH as Shard (Leader)
+
+    CL->>SQ: "SELECT * FROM users WHERE id = 42"
+    SQ->>SQ: Lex → Parse → Analyze → Plan → Optimize
+    note over SQ: Plan: PointGet("users/42")
+    SQ->>KV: Get(shard_id, key="users/42")
+    KV->>SH: Get(key="users/42")
+    SH-->>KV: value={"id":42,"name":"alice","age":30}
+    KV-->>SQ: row bytes
+    SQ->>SQ: Decode row → Project columns
+    SQ-->>CL: ResultSet{columns: [id, name, age], rows: [{42, "alice", 30}]}
+```
+
+**Definition of Done:**
+- All Phase 6 INSERT/SELECT/UPDATE/DELETE tests still pass
+- Optimizer converts PK WHERE to PointGet (verified via plan inspection)
+- Executor returns correct ResultSet for each statement type
+- Error propagation from KV layer (NOT_FOUND, QUORUM_UNAVAILABLE) surfaces as SQL error
+
+---
+
+## Phase 10: SQL — Secondary Indexes
 
 **Theme:** Query by non-primary-key columns.
 
 **New Concepts:**
 - Index maintenance (write-time index update)
-- Index storage (KV encoding of index entries)
-- Index scan in query planner
-- Consistency between primary and index data
+- Index KV encoding
+- Index scan in planner
+- Consistency between primary row and index entries
 
-**What Gets Built:**
-- `CREATE INDEX` support
-- Write path: index entries written atomically with primary row (within a single shard)
-- Read path: index scan → primary key lookup → full row
-- Cross-shard consistency is deferred (single-shard only initially)
+### Index KV Encoding
+
+An index on `users(name)` stores entries:
+
+```
+key:   "idx/users/name/<name_value>/<pk_value>"   e.g. "idx/users/name/alice/42"
+value: "" (empty — the PK is embedded in the key)
+```
+
+The full key includes the PK to handle non-unique indexes. A unique index would omit the PK suffix and enforce uniqueness at write time.
+
+### Write Path with Index
+
+```mermaid
+sequenceDiagram
+    participant E as Executor
+    participant KV as KV Layer
+
+    note over E: INSERT INTO users VALUES (42, 'alice', 30)
+
+    E->>KV: Put("users/42", {"id":42,"name":"alice","age":30})
+    E->>KV: Put("idx/users/name/alice/42", "")
+
+    note over E: Both writes go to the same shard<br/>in a single replication round (Phase 10 only)
+```
+
+### Read Path with Index
+
+```mermaid
+flowchart TD
+    Q["SELECT * FROM users WHERE name = 'alice'"] --> AN[Analyzer]
+    AN --> PL[Planner]
+    PL --> OPT{Index available?}
+    OPT -- yes --> IS[IndexScan<br/>prefix=idx/users/name/alice/]
+    IS --> PKL[PK lookup:<br/>Get users/42]
+    OPT -- no --> TS[TableScan<br/>prefix=users/]
+    PKL --> ROW[Decode row]
+    TS --> ROW
+```
+
+### CREATE INDEX
+
+```sql
+CREATE INDEX idx_name ON users(name);
+CREATE UNIQUE INDEX idx_email ON users(email);
+```
+
+The catalog stores index definitions alongside table definitions.
+
+### Limitations (Phase 10)
+
+- Indexes are only supported for single-shard tables (cross-shard index maintenance requires distributed transactions)
+- No partial indexes
+- No composite indexes
+- Index updates are not atomic with the primary write (addressed in Phase 11)
 
 ---
 
-## Phase 8: Multi-Row Transactions
+## Phase 11: SQL — Multi-Row Transactions
 
-**Theme:** ACID guarantees across multiple operations.
+**Theme:** ACID guarantees across multiple SQL statements.
 
 **New Concepts:**
+- MVCC (multi-version concurrency control)
+- Optimistic locking
 - Two-phase commit (2PC)
-- Transaction coordinator
-- Optimistic vs pessimistic concurrency control
-- Deadlock detection
+- Deadlock detection / prevention
 
-**What Gets Built:**
-- Transaction API: `BEGIN`, `COMMIT`, `ROLLBACK`
-- Single-shard transactions: implemented as serialized batch operation
-- Multi-shard transactions: two-phase commit with coordinator
-- Conflict detection
+### Transaction API
 
-**Note:** This is the most complex phase. Multi-shard transactions require deep coordination and introduce many failure modes. Full correctness here is ambitious; partial implementation is acceptable for the learning goal.
+```sql
+BEGIN;
+UPDATE accounts SET balance = balance - 100 WHERE id = 1;
+UPDATE accounts SET balance = balance + 100 WHERE id = 2;
+COMMIT;  -- or ROLLBACK;
+```
+
+### Single-Shard Transactions
+
+For transactions that touch only one shard, Doki uses **optimistic concurrency control**:
+
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant TX as Tx Coordinator
+    participant SH as Shard Leader
+
+    CL->>TX: BEGIN
+    TX-->>CL: tx_id
+
+    CL->>TX: UPDATE ... WHERE pk=1
+    TX->>SH: Read(key) + record read_version
+
+    CL->>TX: UPDATE ... WHERE pk=2
+    TX->>SH: Read(key) + record read_version
+
+    CL->>TX: COMMIT
+    TX->>SH: Validate(read_versions still current?)
+    note over SH: if conflict: abort
+    SH-->>TX: OK
+    TX->>SH: Apply all writes atomically
+    TX-->>CL: COMMIT OK
+```
+
+### Multi-Shard Transactions (2PC)
+
+```mermaid
+sequenceDiagram
+    participant CL as Client
+    participant TC as Tx Coordinator
+    participant S1 as Shard 1 Leader
+    participant S2 as Shard 2 Leader
+
+    CL->>TC: COMMIT tx_id
+
+    note over TC: Phase 1: Prepare
+    TC->>S1: Prepare(tx_id, writes[])
+    TC->>S2: Prepare(tx_id, writes[])
+    S1-->>TC: PREPARED
+    S2-->>TC: PREPARED
+
+    note over TC: Phase 2: Commit
+    TC->>S1: Commit(tx_id)
+    TC->>S2: Commit(tx_id)
+    S1-->>TC: OK
+    S2-->>TC: OK
+
+    TC-->>CL: COMMIT OK
+```
+
+**Known complexity:** 2PC is not resilient to coordinator failure between phases. Full resilience requires persistent transaction logs and recovery logic. This is acceptable as a learning target — implement it, understand the failure modes, then document them.
 
 ---
 
@@ -276,9 +683,12 @@ DELETE FROM users WHERE id = 1;
 | 3 | Incremental replication | Log-based catch-up |
 | 4 | Distributed election | Raft-like voting |
 | 5 | Dynamic sharding | Migration, membership |
-| 6 | Basic SQL | Parser, planner, executor |
-| 7 | Indexes | Index maintenance |
-| 8 | Transactions | 2PC, concurrency control |
+| 6 | SQL: Lexer, Parser, Schema | Tokenization, AST, catalog |
+| 7 | SQL: Analyzer | Type checking, name resolution |
+| 8 | SQL: Planner, Optimizer | Logical plan, rule-based optimization |
+| 9 | SQL: Executor | Volcano model, result sets |
+| 10 | SQL: Secondary indexes | Index KV encoding, index scans |
+| 11 | SQL: Transactions | MVCC, 2PC |
 
 ---
 

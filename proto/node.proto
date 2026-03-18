@@ -1,0 +1,176 @@
+syntax = "proto3";
+
+package doki.node.v1;
+
+import "common.proto";
+
+option go_package = "github.com/davecarr1024/doki/gen/proto/node/v1;nodev1";
+
+// NodeService is the data-plane API.
+//
+// Clients call this service to read and write data.
+// The leader calls this service on followers to replicate writes.
+// Recovering nodes call this service on the leader to pull snapshots.
+service NodeService {
+  // --- Client-facing operations ---
+
+  // Put writes or overwrites a key in a shard. Must be called on the leader.
+  rpc Put(PutRequest) returns (PutResponse);
+
+  // Get reads a key from a shard. Must be called on the leader.
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Delete removes a key from a shard. Must be called on the leader.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // --- Replication (leader → follower) ---
+
+  // Replicate sends a single write operation from leader to follower.
+  // The follower applies it and returns an ACK.
+  rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+
+  // SyncState streams a full-state snapshot from leader to a recovering follower.
+  rpc SyncState(SyncRequest) returns (stream SnapshotChunk);
+
+  // --- Control (coordinator → node) ---
+
+  // AssignLeader tells a node it is now the leader for a shard.
+  rpc AssignLeader(AssignLeaderRequest) returns (AssignLeaderResponse);
+
+  // SetFollower tells a node who the leader is for a shard (and its term).
+  rpc SetFollower(SetFollowerRequest) returns (SetFollowerResponse);
+
+  // --- Observability ---
+
+  // GetStatus returns the node's current status for all hosted shards.
+  rpc GetStatus(GetStatusRequest) returns (NodeStatus);
+}
+
+// --- Put ---
+
+message PutRequest {
+  string shard_id = 1;
+  bytes key = 2;
+  bytes value = 3;
+}
+
+message PutResponse {
+  enum Result {
+    RESULT_UNSPECIFIED = 0;
+    RESULT_OK = 1;
+    RESULT_NOT_LEADER = 2;
+    RESULT_QUORUM_UNAVAILABLE = 3;
+    RESULT_NOT_READY = 4;
+  }
+  Result result = 1;
+  string leader_hint = 2;  // set when result is NOT_LEADER
+}
+
+// --- Get ---
+
+message GetRequest {
+  string shard_id = 1;
+  bytes key = 2;
+}
+
+message GetResponse {
+  enum Result {
+    RESULT_UNSPECIFIED = 0;
+    RESULT_OK = 1;
+    RESULT_NOT_FOUND = 2;
+    RESULT_NOT_LEADER = 3;
+    RESULT_NOT_READY = 4;
+  }
+  Result result = 1;
+  bytes value = 2;          // set when result is OK
+  string leader_hint = 3;   // set when result is NOT_LEADER
+}
+
+// --- Delete ---
+
+message DeleteRequest {
+  string shard_id = 1;
+  bytes key = 2;
+}
+
+message DeleteResponse {
+  enum Result {
+    RESULT_UNSPECIFIED = 0;
+    RESULT_OK = 1;
+    RESULT_NOT_LEADER = 2;
+    RESULT_QUORUM_UNAVAILABLE = 3;
+    RESULT_NOT_READY = 4;
+  }
+  Result result = 1;
+  string leader_hint = 2;
+}
+
+// --- Replicate ---
+
+message ReplicateRequest {
+  string shard_id = 1;
+  uint64 term = 2;
+  uint64 version = 3;  // version after applying this op
+  doki.common.v1.Operation op = 4;
+}
+
+message ReplicateResponse {
+  bool success = 1;
+  uint64 term = 2;  // follower's current term; if > request.term, sender is stale
+}
+
+// --- SyncState (snapshot recovery) ---
+
+message SyncRequest {
+  string shard_id = 1;
+}
+
+// SnapshotChunk is one piece of the full-state snapshot stream.
+// The receiver accumulates chunks until is_last=true, then applies atomically.
+message SnapshotChunk {
+  string shard_id = 1;
+  uint64 term = 2;
+  uint64 final_version = 3;  // shard version at snapshot time
+  uint32 chunk_index = 4;
+  bool is_last = 5;
+  repeated doki.common.v1.KVEntry entries = 6;
+}
+
+// --- AssignLeader ---
+
+message AssignLeaderRequest {
+  string shard_id = 1;
+  uint64 new_term = 2;
+}
+
+message AssignLeaderResponse {}
+
+// --- SetFollower ---
+
+message SetFollowerRequest {
+  string shard_id = 1;
+  string leader_id = 2;
+  uint64 term = 3;
+}
+
+message SetFollowerResponse {}
+
+// --- GetStatus ---
+
+message GetStatusRequest {}
+
+message ShardStatus {
+  string shard_id = 1;
+  string role = 2;
+  uint64 term = 3;
+  uint64 version = 4;
+  bool is_ready = 5;
+  repeated string peers = 6;
+  map<string, uint64> peer_versions = 7;  // leader only: follower versions
+}
+
+message NodeStatus {
+  string node_id = 1;
+  double uptime_seconds = 2;
+  repeated ShardStatus shards = 3;
+}

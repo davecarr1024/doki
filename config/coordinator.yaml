@@ -1,0 +1,25 @@
+coordinator:
+  address: "0.0.0.0:7000"
+  heartbeat_interval_ms: 500
+  failure_timeout_ms: 1500
+
+nodes:
+  - id: node-a
+    address: "node-a:8000"
+  - id: node-b
+    address: "node-b:8000"
+  - id: node-c
+    address: "node-c:8000"
+
+shards:
+  - id: shard-0
+    replicas: [node-a, node-b, node-c]
+    initial_leader: node-a
+  - id: shard-1
+    replicas: [node-a, node-b, node-c]
+    initial_leader: node-b
+
+replication:
+  quorum_timeout_ms: 1000
+  max_lag_versions: 1000
+  max_buffered_versions: 100
