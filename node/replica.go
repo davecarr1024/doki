@@ -21,8 +21,12 @@ const (
 // All fields are protected by mu. The caller (server.go) is responsible for acquiring
 // the lock before accessing fields directly; methods on ReplicaState are not
 // individually lock-safe unless documented otherwise.
+//
+// writeMu serializes concurrent write requests; it is separate from mu so that
+// long-running replication fan-out does not block status reads.
 type ReplicaState struct {
-	mu sync.RWMutex
+	mu      sync.RWMutex
+	writeMu sync.Mutex
 
 	// ShardID is the shard this replica is serving.
 	ShardID string

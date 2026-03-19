@@ -14,42 +14,53 @@ import (
 	"github.com/davecarr1024/doki/coordinator"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
-	"github.com/davecarr1024/doki/internal/shardmap"
 )
 
 // Server is a leaf node's HTTP server.
 //
-// It exposes:
-//   - GET  /status  — node and shard replica health
-//   - GET  /ready   — readiness check
+// Phase 0 endpoints:
+//   - GET  /status                         — node and shard replica health
+//   - GET  /ready                          — readiness check
 //
-// In Phase 0, the node only heartbeats to the coordinator and exposes health
-// endpoints. KV operations and replication are added in Phase 1.
+// Phase 1 endpoints:
+//   - POST /kv/{shard_id}                  — KV operations (put/get/delete); leader only
+//   - POST /internal/replicate/{shard_id}  — replication fan-out from leader
+//   - GET  /internal/sync/{shard_id}       — full-state sync for recovering followers
 type Server struct {
-	cfg        *config.NodeConfig
-	clock      clock.Clock
-	replicas   map[string]*ReplicaState // shard_id → replica
-	mu         sync.RWMutex
-	startedAt  time.Time
-	httpServer *http.Server
+	cfg             *config.NodeConfig
+	clock           clock.Clock
+	replicas        map[string]*ReplicaState // shard_id → replica
+	nodeAddresses   map[string]string        // nodeID → HTTP address (from coordinator)
+	shardMapVersion uint64
+	mu              sync.RWMutex
+	startedAt       time.Time
+	httpServer      *http.Server
 }
 
 // NewServer creates a node Server from the given config.
 func NewServer(cfg *config.NodeConfig, clk clock.Clock) *Server {
+	cfg.EnsureDefaults()
+	if clk == nil {
+		clk = clock.Real{}
+	}
 	return &Server{
-		cfg:       cfg,
-		clock:     clk,
-		replicas:  make(map[string]*ReplicaState),
-		startedAt: clk.Now(),
+		cfg:           cfg,
+		clock:         clk,
+		replicas:      make(map[string]*ReplicaState),
+		nodeAddresses: make(map[string]string),
+		startedAt:     clk.Now(),
 	}
 }
 
-// InitShards creates replica state for each shard this node participates in,
-// using the shard map provided by the coordinator.
-func (s *Server) InitShards(shards []shardmap.ShardInfo) {
+// InitShards creates replica state for each shard this node participates in.
+// The full ShardMapResponse from the coordinator is used so that peer node
+// addresses are available for replication fan-out and recovery.
+func (s *Server) InitShards(resp coordinator.ShardMapResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, shard := range shards {
+	s.nodeAddresses = resp.NodeAddresses
+	s.shardMapVersion = resp.Version
+	for _, shard := range resp.Shards {
 		if !shard.HasReplica(s.cfg.Node.ID) {
 			continue
 		}
@@ -60,18 +71,17 @@ func (s *Server) InitShards(shards []shardmap.ShardInfo) {
 			}
 		}
 		r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers)
-		// In Phase 0, mark replicas as ready immediately (no real recovery yet)
-		r.IsReady = true
 		if shard.Leader == s.cfg.Node.ID {
 			r.Role = RoleLeader
+			r.IsReady = true // leader starts fresh with empty KV; no recovery needed
 		}
 		r.LeaderID = shard.Leader
 		s.replicas[shard.ID] = r
-		log.Printf("shard initialized shard_id=%s role=%s", shard.ID, r.Role)
+		log.Printf("shard initialized shard_id=%s role=%s leader=%s", shard.ID, r.Role, r.LeaderID)
 	}
 }
 
-// Start begins serving HTTP and runs the heartbeat loop in the background.
+// Start begins serving HTTP and runs background goroutines.
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
@@ -79,16 +89,13 @@ func (s *Server) Start(ctx context.Context) error {
 		Addr:    s.cfg.Node.Address,
 		Handler: mux,
 	}
-
-	go s.runHeartbeat(ctx)
-
+	s.startBackgroundJobs(ctx)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.httpServer.Shutdown(shutCtx)
 	}()
-
 	log.Printf("node listening node_id=%s address=%s", s.cfg.Node.ID, s.cfg.Node.Address)
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("node http server: %w", err)
@@ -102,16 +109,13 @@ func (s *Server) StartOnListener(ctx context.Context, l net.Listener) error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 	s.httpServer = &http.Server{Handler: mux}
-
-	go s.runHeartbeat(ctx)
-
+	s.startBackgroundJobs(ctx)
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.httpServer.Shutdown(shutCtx)
 	}()
-
 	log.Printf("node listening node_id=%s address=%s", s.cfg.Node.ID, l.Addr())
 	if err := s.httpServer.Serve(l); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("node http server: %w", err)
@@ -119,18 +123,59 @@ func (s *Server) StartOnListener(ctx context.Context, l net.Listener) error {
 	return nil
 }
 
+func (s *Server) startBackgroundJobs(ctx context.Context) {
+	go s.runHeartbeat(ctx)
+	// Start recovery loops for follower replicas that are not yet ready.
+	s.mu.RLock()
+	for _, r := range s.replicas {
+		if r.Role == RoleFollower && !r.IsReady {
+			r := r
+			go runRecoveryLoop(ctx, r, func() string {
+				return s.leaderAddrForReplica(r)
+			})
+		}
+	}
+	s.mu.RUnlock()
+}
+
+// leaderAddrForReplica returns the HTTP address of the current leader for the given replica.
+// Returns "" if the leader is unknown or has no known address.
+func (s *Server) leaderAddrForReplica(r *ReplicaState) string {
+	r.mu.RLock()
+	leaderID := r.LeaderID
+	r.mu.RUnlock()
+	if leaderID == "" {
+		return ""
+	}
+	s.mu.RLock()
+	addr := s.nodeAddresses[leaderID]
+	s.mu.RUnlock()
+	return addr
+}
+
 func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ready", s.handleReady)
+	mux.HandleFunc("POST /kv/{shard_id}", s.handleKV)
+	mux.HandleFunc("POST /internal/replicate/{shard_id}", s.handleReplicate)
+	mux.HandleFunc("GET /internal/sync/{shard_id}", s.handleSync)
+}
+
+// Handler builds and returns the HTTP handler for this server.
+// Useful for testing individual handlers via httptest without starting a listener.
+func (s *Server) Handler() http.Handler {
+	mux := http.NewServeMux()
+	s.registerRoutes(mux)
+	return mux
 }
 
 // --- Handlers ---
 
 // NodeStatusResponse is the full body of GET /status.
 type NodeStatusResponse struct {
-	NodeID        string                   `json:"node_id"`
-	UptimeSeconds float64                  `json:"uptime_seconds"`
-	Shards        []ReplicaStatusSnapshot  `json:"shards"`
+	NodeID        string                  `json:"node_id"`
+	UptimeSeconds float64                 `json:"uptime_seconds"`
+	Shards        []ReplicaStatusSnapshot `json:"shards"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -154,8 +199,7 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	s.mu.RLock()
 	allReady := true
 	for _, rep := range s.replicas {
-		snap := rep.StatusSnapshot()
-		if !snap.IsReady {
+		if !rep.StatusSnapshot().IsReady {
 			allReady = false
 			break
 		}
@@ -170,12 +214,240 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
 }
 
+// KVRequest is the body of POST /kv/{shard_id}.
+type KVRequest struct {
+	Op    string `json:"op"`              // "put", "get", or "delete"
+	Key   string `json:"key"`
+	Value string `json:"value,omitempty"` // only for "put"
+}
+
+// KVResponse is returned by POST /kv/{shard_id}.
+type KVResponse struct {
+	OK           bool   `json:"ok"`
+	Value        string `json:"value,omitempty"`
+	Error        string `json:"error,omitempty"`
+	LeaderID     string `json:"leader_id,omitempty"`
+	LeaderAddress string `json:"leader_address,omitempty"`
+}
+
+func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
+	shardID := r.PathValue("shard_id")
+
+	s.mu.RLock()
+	replica := s.replicas[shardID]
+	s.mu.RUnlock()
+
+	if replica == nil {
+		http.Error(w, "shard not found", http.StatusNotFound)
+		return
+	}
+
+	snap := replica.StatusSnapshot()
+
+	// Only leaders serve KV requests.
+	if snap.Role != RoleLeader {
+		leaderAddr := ""
+		s.mu.RLock()
+		leaderAddr = s.nodeAddresses[snap.LeaderID]
+		s.mu.RUnlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusMisdirectedRequest)
+		_ = json.NewEncoder(w).Encode(KVResponse{
+			OK:            false,
+			Error:         "NOT_LEADER",
+			LeaderID:      snap.LeaderID,
+			LeaderAddress: leaderAddr,
+		})
+		return
+	}
+
+	if !snap.IsReady {
+		http.Error(w, "replica not ready", http.StatusServiceUnavailable)
+		return
+	}
+
+	var req KVRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+
+	switch req.Op {
+	case "get":
+		val, ok := replica.KV.Get(req.Key)
+		if !ok {
+			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: "not found"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(KVResponse{OK: true, Value: val})
+
+	case "put":
+		if err := s.leaderWrite(r.Context(), replica, req); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(KVResponse{OK: true})
+
+	case "delete":
+		if err := s.leaderWrite(r.Context(), replica, req); err != nil {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(KVResponse{OK: true})
+
+	default:
+		http.Error(w, "unknown op: "+req.Op, http.StatusBadRequest)
+	}
+}
+
+// leaderWrite applies a write locally, fans out to followers, and checks quorum.
+func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVRequest) error {
+	replica.writeMu.Lock()
+	defer replica.writeMu.Unlock()
+
+	replica.mu.Lock()
+	term := replica.Term
+	version := replica.Version + 1
+	// Apply locally.
+	switch req.Op {
+	case "put":
+		replica.KV.Put(req.Key, req.Value)
+	case "delete":
+		replica.KV.Delete(req.Key)
+	}
+	replica.Version = version
+	// Collect peer addresses while holding the lock.
+	peers := append([]string(nil), replica.Peers...)
+	replica.mu.Unlock()
+
+	// Determine quorum requirement.
+	// We count the leader as 1; need (quorum-1) follower ACKs.
+	s.mu.RLock()
+	peerAddrs := make([]string, 0, len(peers))
+	for _, peerID := range peers {
+		if addr, ok := s.nodeAddresses[peerID]; ok {
+			peerAddrs = append(peerAddrs, addr)
+		}
+	}
+	s.mu.RUnlock()
+
+	// Total replicas = followers + 1 (leader). Quorum = floor(total/2)+1.
+	total := len(peers) + 1
+	quorum := total/2 + 1
+	needed := quorum - 1 // leader already counts as 1
+
+	if needed == 0 {
+		// Single-replica shard; no followers needed.
+		return nil
+	}
+
+	replReq := ReplicateRequest{
+		Term:    term,
+		Version: version,
+		Op:      req.Op,
+		Key:     req.Key,
+		Value:   req.Value,
+	}
+	acks := fanOutReplicate(ctx, replica.ShardID, replReq, peerAddrs, s.cfg.QuorumTimeout)
+	if acks < needed {
+		return fmt.Errorf("quorum unavailable: got %d/%d follower ACKs", acks, needed)
+	}
+	return nil
+}
+
+// handleReplicate handles POST /internal/replicate/{shard_id} from the leader.
+func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
+	shardID := r.PathValue("shard_id")
+
+	s.mu.RLock()
+	replica := s.replicas[shardID]
+	s.mu.RUnlock()
+
+	if replica == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Error: "shard not found"})
+		return
+	}
+
+	var req ReplicateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Error: "bad request"})
+		return
+	}
+
+	replica.mu.Lock()
+	// Reject stale leader.
+	if req.Term < replica.Term {
+		term := replica.Term
+		replica.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Term: term, Error: "stale term"})
+		return
+	}
+	// Apply the write.
+	switch req.Op {
+	case "put":
+		replica.KV.Put(req.Key, req.Value)
+	case "delete":
+		replica.KV.Delete(req.Key)
+	}
+	replica.Version = req.Version
+	if req.Term > replica.Term {
+		replica.Term = req.Term
+	}
+	replica.IsReady = true // receiving replication means we're in sync
+	replica.mu.Unlock()
+
+	log.Printf("replicated shard_id=%s op=%s key=%s version=%d", shardID, req.Op, req.Key, req.Version)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: req.Term})
+}
+
+// handleSync handles GET /internal/sync/{shard_id} — full-state snapshot for recovery.
+func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
+	shardID := r.PathValue("shard_id")
+
+	s.mu.RLock()
+	replica := s.replicas[shardID]
+	s.mu.RUnlock()
+
+	if replica == nil {
+		http.Error(w, "shard not found", http.StatusNotFound)
+		return
+	}
+
+	replica.mu.RLock()
+	if replica.Role != RoleLeader {
+		replica.mu.RUnlock()
+		http.Error(w, "not leader", http.StatusServiceUnavailable)
+		return
+	}
+	kv := replica.KV.Snapshot()
+	version := replica.Version
+	term := replica.Term
+	replica.mu.RUnlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(SyncResponse{
+		Term:    term,
+		Version: version,
+		KV:      kv,
+	})
+}
+
 // --- Heartbeat ---
 
 func (s *Server) runHeartbeat(ctx context.Context) {
 	ticker := time.NewTicker(s.cfg.HeartbeatInterval)
 	defer ticker.Stop()
-	// Send one immediately on startup
+	// Send one immediately on startup.
 	s.sendHeartbeat()
 	for {
 		select {
@@ -219,7 +491,65 @@ func (s *Server) sendHeartbeat() {
 		return
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("heartbeat rejected node_id=%s status=%d", s.cfg.Node.ID, resp.StatusCode)
+		return
+	}
+
+	// Check if coordinator's shard map version is newer; if so, refetch.
+	var hbResp coordinator.HeartbeatResponse
+	if err := json.NewDecoder(resp.Body).Decode(&hbResp); err != nil {
+		return
+	}
+	s.mu.RLock()
+	currentVersion := s.shardMapVersion
+	s.mu.RUnlock()
+	if hbResp.ShardMapVersion > currentVersion {
+		s.refetchShardMap()
 	}
 }
+
+// refetchShardMap pulls an updated shard map from the coordinator and applies
+// any leader or role changes to existing replicas.
+func (s *Server) refetchShardMap() {
+	url := "http://" + s.cfg.CoordinatorAddress + "/shardmap"
+	resp, err := http.Get(url) //nolint:noctx
+	if err != nil {
+		log.Printf("shardmap refetch failed node_id=%s err=%v", s.cfg.Node.ID, err)
+		return
+	}
+	defer resp.Body.Close()
+	var smResp coordinator.ShardMapResponse
+	if err := json.NewDecoder(resp.Body).Decode(&smResp); err != nil {
+		log.Printf("shardmap decode failed node_id=%s err=%v", s.cfg.Node.ID, err)
+		return
+	}
+
+	s.mu.Lock()
+	s.nodeAddresses = smResp.NodeAddresses
+	s.shardMapVersion = smResp.Version
+	for _, shard := range smResp.Shards {
+		r := s.replicas[shard.ID]
+		if r == nil {
+			continue
+		}
+		r.mu.Lock()
+		oldLeader := r.LeaderID
+		r.LeaderID = shard.Leader
+		if shard.Leader == s.cfg.Node.ID && r.Role != RoleLeader {
+			r.Role = RoleLeader
+			r.IsReady = true
+			log.Printf("promoted to leader shard_id=%s", shard.ID)
+		} else if shard.Leader != s.cfg.Node.ID && r.Role == RoleLeader {
+			r.Role = RoleFollower
+			log.Printf("demoted to follower shard_id=%s", shard.ID)
+		}
+		if r.LeaderID != oldLeader {
+			log.Printf("leader changed shard_id=%s old=%s new=%s", shard.ID, oldLeader, r.LeaderID)
+		}
+		r.mu.Unlock()
+	}
+	s.mu.Unlock()
+}
+

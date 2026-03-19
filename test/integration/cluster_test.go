@@ -19,7 +19,6 @@ import (
 	"github.com/davecarr1024/doki/coordinator"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
-	"github.com/davecarr1024/doki/internal/shardmap"
 	"github.com/davecarr1024/doki/node"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -95,11 +94,11 @@ func startCluster(t *testing.T, nodeIDs []string, shardSpecs []config.ShardSpec)
 			HeartbeatIntervalMs: 100,
 			HeartbeatInterval:   100 * time.Millisecond,
 		}
-		// Fetch shard map from coordinator
-		shardInfos := fetchShardMapHTTP(t, "http://"+coordAddr+"/shardmap")
+		// Fetch full shard map response from coordinator (includes node addresses).
+		smResp := fetchShardMapRespHTTP(t, "http://"+coordAddr+"/shardmap")
 
 		srv := node.NewServer(nodeCfg, clock.Real{})
-		srv.InitShards(shardInfos)
+		srv.InitShards(smResp)
 		go func() {
 			if err := srv.StartOnListener(ctx, l); err != nil {
 				t.Logf("node %s stopped: %v", id, err)
@@ -247,9 +246,9 @@ func getJSONDecoded(t *testing.T, url string, out any) bool {
 	return true
 }
 
-func fetchShardMapHTTP(t *testing.T, url string) []shardmap.ShardInfo {
+func fetchShardMapRespHTTP(t *testing.T, url string) coordinator.ShardMapResponse {
 	t.Helper()
 	var sm coordinator.ShardMapResponse
 	require.True(t, getJSONDecoded(t, url, &sm))
-	return sm.Shards
+	return sm
 }

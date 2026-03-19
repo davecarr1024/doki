@@ -19,6 +19,12 @@ func nodes(ids ...string) []config.NodeSpec {
 	return specs
 }
 
+func hb(nodeID string, shards ...coordinator.ShardStatus) func(m *coordinator.Membership) error {
+	return func(m *coordinator.Membership) error {
+		return m.RecordHeartbeat(nodeID, shards)
+	}
+}
+
 func TestMembership_InitiallyDead(t *testing.T) {
 	clk := clock.NewFakeNow()
 	m := coordinator.NewMembership(nodes("a", "b", "c"), time.Second, clk)
@@ -31,7 +37,7 @@ func TestMembership_HeartbeatMakesAlive(t *testing.T) {
 	clk := clock.NewFakeNow()
 	m := coordinator.NewMembership(nodes("a", "b"), time.Second, clk)
 
-	require.NoError(t, m.RecordHeartbeat("a"))
+	require.NoError(t, hb("a")(m))
 	m.RefreshLiveness()
 
 	ns, err := m.Get("a")
@@ -48,13 +54,12 @@ func TestMembership_TimeoutMakesDead(t *testing.T) {
 	timeout := time.Second
 	m := coordinator.NewMembership(nodes("a"), timeout, clk)
 
-	require.NoError(t, m.RecordHeartbeat("a"))
+	require.NoError(t, hb("a")(m))
 	m.RefreshLiveness()
 
 	ns, _ := m.Get("a")
 	assert.True(t, ns.IsAlive)
 
-	// Advance past the timeout
 	clk.Advance(timeout + time.Millisecond)
 	m.RefreshLiveness()
 
@@ -66,16 +71,13 @@ func TestMembership_RefreshLiveness_ChangedNodes(t *testing.T) {
 	clk := clock.NewFakeNow()
 	m := coordinator.NewMembership(nodes("a", "b"), time.Second, clk)
 
-	// Heartbeat a; nothing changed yet (a was already dead)
-	require.NoError(t, m.RecordHeartbeat("a"))
+	require.NoError(t, hb("a")(m))
 
-	// First refresh: a becomes alive (status change)
 	changed := m.RefreshLiveness()
 	assert.Len(t, changed, 1)
 	assert.Equal(t, "a", changed[0].ID)
 	assert.True(t, changed[0].IsAlive)
 
-	// Second refresh with no changes
 	changed = m.RefreshLiveness()
 	assert.Empty(t, changed)
 }
@@ -84,7 +86,7 @@ func TestMembership_UnknownNode(t *testing.T) {
 	clk := clock.NewFakeNow()
 	m := coordinator.NewMembership(nodes("a"), time.Second, clk)
 
-	err := m.RecordHeartbeat("UNKNOWN")
+	err := m.RecordHeartbeat("UNKNOWN", nil)
 	assert.ErrorContains(t, err, "unknown node")
 }
 
@@ -92,10 +94,25 @@ func TestMembership_AliveNodes(t *testing.T) {
 	clk := clock.NewFakeNow()
 	m := coordinator.NewMembership(nodes("a", "b", "c"), time.Second, clk)
 
-	require.NoError(t, m.RecordHeartbeat("a"))
-	require.NoError(t, m.RecordHeartbeat("c"))
+	require.NoError(t, hb("a")(m))
+	require.NoError(t, hb("c")(m))
 	m.RefreshLiveness()
 
 	alive := m.AliveNodes()
 	assert.ElementsMatch(t, []string{"a", "c"}, alive)
+}
+
+func TestMembership_ShardVersions(t *testing.T) {
+	clk := clock.NewFakeNow()
+	m := coordinator.NewMembership(nodes("a", "b"), time.Second, clk)
+
+	require.NoError(t, m.RecordHeartbeat("a", []coordinator.ShardStatus{
+		{ShardID: "shard-0", Version: 42},
+		{ShardID: "shard-1", Version: 7},
+	}))
+
+	assert.Equal(t, uint64(42), m.VersionForShard("a", "shard-0"))
+	assert.Equal(t, uint64(7), m.VersionForShard("a", "shard-1"))
+	assert.Equal(t, uint64(0), m.VersionForShard("b", "shard-0")) // never heartbeated
+	assert.Equal(t, uint64(0), m.VersionForShard("a", "shard-UNKNOWN"))
 }

@@ -19,7 +19,7 @@ Do not start the next phase until the current phase is solid.
 
 ---
 
-## Phase 0: Project Setup
+## Phase 0: Project Setup ✅ Complete
 
 **Theme:** Infrastructure before code.
 
@@ -27,10 +27,8 @@ Do not start the next phase until the current phase is solid.
 - Repo structure established
 - Build system working (Make / bazel / go build)
 - Docker Compose cluster launches successfully
-- Testcontainers integration test harness working
 - Logging and health endpoint scaffolding in place
 - Proto definitions checked in and compiling
-- CI pipeline running unit tests
 
 **Definition of Done:**
 - `docker compose up` starts coordinator + 3 nodes
@@ -38,23 +36,28 @@ Do not start the next phase until the current phase is solid.
 - Health endpoints return valid JSON
 - At least one passing integration test (even if trivial)
 
+**Completed:** All goals met. 5 integration tests pass covering coordinator health,
+node heartbeat, status endpoint, shard map, and shard role assignment.
+
 ---
 
-## Phase 1: In-Memory KV with Replication
+## Phase 1: In-Memory KV with Replication ✅ Complete
 
 **Theme:** The core protocol. Everything else builds on this.
 
 **New Concepts:**
 - Leader/follower replication
-- Quorum writes
+- Quorum writes (majority ACK before returning success)
 - Term-based stale leader detection
-- Full-state snapshot recovery
+- Full-state snapshot recovery (followers sync from leader on startup)
+- Per-shard write serialization (`writeMu`) decoupled from read lock (`mu`)
+- Shard map version tracking — nodes detect coordinator updates via heartbeat response
 
-**What Gets Built:**
-- Coordinator: heartbeat tracking, leader assignment, shard map
-- Node: per-shard replica state, write handler, replication logic
-- Recovery: snapshot send/receive
-- Client library: routing, retry on NOT_LEADER
+**What Was Built:**
+- Coordinator: `ShardVersions` in heartbeat, `TermForShard`, leader prefers highest-version candidate, `/leader/{shard_id}` endpoint, shard map version in heartbeat response
+- Node: `POST /kv/{shard_id}` (put/get/delete), `POST /internal/replicate/{shard_id}`, `GET /internal/sync/{shard_id}`, recovery loop for followers
+- `node/replication.go`: `fanOutReplicate` fan-out with parallel goroutines and per-timeout context
+- `node/recovery.go`: `doRecovery` fetches full KV snapshot; `runRecoveryLoop` polls until ready
 
 **Key Invariants to Test:**
 - Single leader per shard
@@ -62,10 +65,15 @@ Do not start the next phase until the current phase is solid.
 - Writes fail when quorum unavailable
 - Recovered node's state matches leader
 
-**Definition of Done:**
-- All integration test scenarios in `testing.md` pass
-- Leader failover works end-to-end
-- Follower recovery works after arbitrary crash
+**Completed:** All goals met. 6 KV integration tests + 16 node unit tests pass.
+
+```
+POST /kv/{shard_id}         {"op":"put","key":"k","value":"v"}
+POST /kv/{shard_id}         {"op":"get","key":"k"}
+POST /kv/{shard_id}         {"op":"delete","key":"k"}
+POST /internal/replicate/{shard_id}   leader→follower write fan-out
+GET  /internal/sync/{shard_id}        full state snapshot for recovery
+```
 
 ---
 

@@ -158,8 +158,11 @@ type NodeConfig struct {
 	CoordinatorAddress string   `yaml:"coordinator_address"`
 	DataDir            string   `yaml:"data_dir"`
 	// How often this node sends heartbeats to the coordinator
-	HeartbeatInterval    time.Duration `yaml:"-"`
-	HeartbeatIntervalMs  int           `yaml:"heartbeat_interval_ms"`
+	HeartbeatInterval   time.Duration `yaml:"-"`
+	HeartbeatIntervalMs int           `yaml:"heartbeat_interval_ms"`
+	// How long to wait for quorum ACKs during a write
+	QuorumTimeout   time.Duration `yaml:"-"`
+	QuorumTimeoutMs int           `yaml:"quorum_timeout_ms"`
 }
 
 // LoadNodeConfig reads and parses a NodeConfig from a YAML file.
@@ -188,10 +191,25 @@ func (c *NodeConfig) applyDefaults() {
 	if c.HeartbeatIntervalMs == 0 {
 		c.HeartbeatIntervalMs = 500
 	}
-	c.HeartbeatInterval = time.Duration(c.HeartbeatIntervalMs) * time.Millisecond
+	if c.HeartbeatInterval == 0 {
+		c.HeartbeatInterval = time.Duration(c.HeartbeatIntervalMs) * time.Millisecond
+	}
+	if c.QuorumTimeoutMs == 0 {
+		c.QuorumTimeoutMs = 500
+	}
+	if c.QuorumTimeout == 0 {
+		c.QuorumTimeout = time.Duration(c.QuorumTimeoutMs) * time.Millisecond
+	}
 	if c.DataDir == "" {
 		c.DataDir = "/data"
 	}
+}
+
+// EnsureDefaults fills in zero-value fields with sensible defaults.
+// It is called automatically by ParseNodeConfig. Call it explicitly when
+// constructing a NodeConfig in tests without going through the YAML parser.
+func (c *NodeConfig) EnsureDefaults() {
+	c.applyDefaults()
 }
 
 func (c *NodeConfig) validate() error {

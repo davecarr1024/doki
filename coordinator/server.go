@@ -16,11 +16,12 @@ import (
 
 // Server is the coordinator's HTTP server.
 //
-// It exposes:
-//   - POST /heartbeat  — nodes call this to signal liveness
-//   - GET  /shardmap   — returns the current shard map
-//   - GET  /status     — cluster health overview
-//   - GET  /ready      — readiness check (returns 200 when initialized)
+// Phase 1 endpoints:
+//   - POST /heartbeat      — nodes report liveness and shard versions
+//   - GET  /shardmap       — returns shard map + node addresses
+//   - GET  /status         — cluster health overview
+//   - GET  /ready          — readiness probe
+//   - GET  /leader/{shard} — direct leader lookup for a shard
 type Server struct {
 	cfg        *config.ClusterConfig
 	membership *Membership
@@ -46,7 +47,6 @@ func NewServer(cfg *config.ClusterConfig, clk clock.Clock) *Server {
 }
 
 // Init populates the shard map from config and marks the server as ready.
-// Must be called before Start().
 func (s *Server) Init() error {
 	if err := s.leader.InitFromConfig(s.cfg); err != nil {
 		return fmt.Errorf("coordinator init: %w", err)
@@ -55,28 +55,18 @@ func (s *Server) Init() error {
 	return nil
 }
 
-// Start begins serving HTTP on the configured address and runs the health
-// monitor in the background. It blocks until ctx is cancelled.
+// Start begins serving HTTP on the configured address.
 func (s *Server) Start(ctx context.Context) error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-
-	s.httpServer = &http.Server{
-		Addr:    s.cfg.Coordinator.Address,
-		Handler: mux,
-	}
-
-	// Health monitor: periodically refresh liveness and reassign leaders
+	s.httpServer = &http.Server{Addr: s.cfg.Coordinator.Address, Handler: mux}
 	go s.runHealthMonitor(ctx)
-
-	// Shut down HTTP server when context is cancelled
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.httpServer.Shutdown(shutCtx)
 	}()
-
 	log.Printf("coordinator listening address=%s", s.cfg.Coordinator.Address)
 	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("coordinator http server: %w", err)
@@ -84,23 +74,18 @@ func (s *Server) Start(ctx context.Context) error {
 	return nil
 }
 
-// StartOnListener starts the server on the provided net.Listener.
-// Used in tests to bind to a random port (":0").
+// StartOnListener starts the server on the provided net.Listener (used in tests).
 func (s *Server) StartOnListener(ctx context.Context, l net.Listener) error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
-
 	s.httpServer = &http.Server{Handler: mux}
-
 	go s.runHealthMonitor(ctx)
-
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = s.httpServer.Shutdown(shutCtx)
 	}()
-
 	log.Printf("coordinator listening address=%s", l.Addr())
 	if err := s.httpServer.Serve(l); err != nil && err != http.ErrServerClosed {
 		return fmt.Errorf("coordinator http server: %w", err)
@@ -113,6 +98,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /shardmap", s.handleShardMap)
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ready", s.handleReady)
+	mux.HandleFunc("GET /leader/{shard_id}", s.handleLeaderQuery)
 }
 
 // --- Handlers ---
@@ -123,24 +109,71 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	if err := s.membership.RecordHeartbeat(req.NodeID); err != nil {
+	if err := s.membership.RecordHeartbeat(req.NodeID, req.Shards); err != nil {
 		log.Printf("heartbeat rejected node_id=%s err=%v", req.NodeID, err)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	smVersion, _ := s.shards.Snapshot()
+	resp := HeartbeatResponse{ShardMapVersion: smVersion}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // ShardMapResponse is the JSON body returned by GET /shardmap.
+// NodeAddresses maps node IDs to their HTTP addresses so nodes can
+// contact each other for replication and recovery.
 type ShardMapResponse struct {
-	Version uint64           `json:"version"`
-	Shards  []shardmap.ShardInfo `json:"shards"`
+	Version       uint64            `json:"version"`
+	Shards        []shardmap.ShardInfo `json:"shards"`
+	NodeAddresses map[string]string `json:"node_addresses"`
 }
 
 func (s *Server) handleShardMap(w http.ResponseWriter, r *http.Request) {
+	resp := s.buildShardMapResponse()
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
+}
+
+func (s *Server) buildShardMapResponse() ShardMapResponse {
 	version, shards := s.shards.Snapshot()
-	resp := ShardMapResponse{Version: version, Shards: shards}
+	nodeAddrs := make(map[string]string, len(s.cfg.Nodes))
+	for _, n := range s.cfg.Nodes {
+		nodeAddrs[n.ID] = n.Address
+	}
+	return ShardMapResponse{
+		Version:       version,
+		Shards:        shards,
+		NodeAddresses: nodeAddrs,
+	}
+}
+
+// LeaderQueryResponse is returned by GET /leader/{shard_id}.
+type LeaderQueryResponse struct {
+	ShardID  string `json:"shard_id"`
+	LeaderID string `json:"leader_id"`
+	Address  string `json:"address"`
+	Term     uint64 `json:"term"`
+}
+
+func (s *Server) handleLeaderQuery(w http.ResponseWriter, r *http.Request) {
+	shardID := r.PathValue("shard_id")
+	leader, err := s.shards.LeaderFor(shardID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	ns, err := s.membership.Get(leader)
+	if err != nil {
+		http.Error(w, "leader node not found", http.StatusInternalServerError)
+		return
+	}
+	resp := LeaderQueryResponse{
+		ShardID:  shardID,
+		LeaderID: leader,
+		Address:  ns.Address,
+		Term:     s.leader.TermForShard(shardID),
+	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -150,7 +183,7 @@ type NodeStatusResponse struct {
 	NodeID          string `json:"node_id"`
 	Address         string `json:"address"`
 	IsAlive         bool   `json:"is_alive"`
-	LastHeartbeatMs int64  `json:"last_heartbeat_ms"` // ms since last heartbeat, -1 if never
+	LastHeartbeatMs int64  `json:"last_heartbeat_ms"`
 }
 
 // CoordinatorStatusResponse is the full body of GET /status.
@@ -214,7 +247,6 @@ func (s *Server) runHealthMonitor(ctx context.Context) {
 						log.Printf("node failure detected node_id=%s", ns.ID)
 					}
 				}
-				// Potentially reassign leaders if any leader went down
 				s.leader.CheckAndReassign()
 			}
 		}

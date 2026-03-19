@@ -15,6 +15,10 @@ type NodeStatus struct {
 	Address         string
 	IsAlive         bool
 	LastHeartbeatAt time.Time
+	// ShardVersions tracks the last reported version for each shard hosted by this node.
+	// Populated from heartbeat payloads; used to select the best candidate when
+	// reassigning a leader (prefer highest version).
+	ShardVersions map[string]uint64
 }
 
 // ShardStatus is reported by nodes in their heartbeat.
@@ -30,6 +34,13 @@ type ShardStatus struct {
 type HeartbeatRequest struct {
 	NodeID string        `json:"node_id"`
 	Shards []ShardStatus `json:"shards"`
+}
+
+// HeartbeatResponse is returned to nodes after a heartbeat.
+// If ShardMapVersion is higher than the node's cached version, the node
+// should refetch the shard map and update its role assignments.
+type HeartbeatResponse struct {
+	ShardMapVersion uint64 `json:"shard_map_version"`
 }
 
 // Membership tracks the liveness of all nodes in the cluster.
@@ -52,18 +63,18 @@ func NewMembership(nodes []config.NodeSpec, failureTimeout time.Duration, clk cl
 	}
 	for _, n := range nodes {
 		m.nodes[n.ID] = &NodeStatus{
-			ID:      n.ID,
-			Address: n.Address,
-			IsAlive: false, // starts dead; becomes alive on first heartbeat
+			ID:            n.ID,
+			Address:       n.Address,
+			IsAlive:       false,
+			ShardVersions: make(map[string]uint64),
 		}
 	}
 	return m
 }
 
-// RecordHeartbeat records the time of the latest heartbeat from a node.
-// Liveness is determined by RefreshLiveness, not here.
+// RecordHeartbeat records a heartbeat from nodeID including the node's shard statuses.
 // Returns an error if the nodeID is not a known cluster member.
-func (m *Membership) RecordHeartbeat(nodeID string) error {
+func (m *Membership) RecordHeartbeat(nodeID string, shards []ShardStatus) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	ns, ok := m.nodes[nodeID]
@@ -71,12 +82,14 @@ func (m *Membership) RecordHeartbeat(nodeID string) error {
 		return fmt.Errorf("unknown node %q", nodeID)
 	}
 	ns.LastHeartbeatAt = m.clock.Now()
+	for _, s := range shards {
+		ns.ShardVersions[s.ShardID] = s.Version
+	}
 	return nil
 }
 
 // RefreshLiveness re-evaluates which nodes are alive based on the failure timeout.
-// Call this periodically (e.g., every heartbeat_interval).
-// Returns the list of nodes whose status changed (newly dead or newly alive).
+// Returns the list of nodes whose status changed.
 func (m *Membership) RefreshLiveness() []NodeStatus {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -129,4 +142,16 @@ func (m *Membership) AliveNodes() []string {
 		}
 	}
 	return alive
+}
+
+// VersionForShard returns the last reported version of a shard on a given node.
+// Returns 0 if unknown.
+func (m *Membership) VersionForShard(nodeID, shardID string) uint64 {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	ns, ok := m.nodes[nodeID]
+	if !ok {
+		return 0
+	}
+	return ns.ShardVersions[shardID]
 }

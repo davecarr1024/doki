@@ -62,8 +62,8 @@ The project is built incrementally. Know which phase you are in before adding co
 
 | Phase | Status | What it adds |
 |-------|--------|-------------|
-| 0 | **Current** | Infrastructure, health endpoints, heartbeat, scaffolding |
-| 1 | Planned | In-memory KV, replication, quorum writes, recovery |
+| 0 | Complete | Infrastructure, health endpoints, heartbeat, scaffolding |
+| 1 | **Current** | In-memory KV, replication, quorum writes, snapshot recovery |
 | 2 | Planned | WAL + durability |
 | 3 | Planned | Incremental replication log |
 | 4 | Planned | Distributed leader election |
