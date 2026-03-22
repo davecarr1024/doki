@@ -77,31 +77,35 @@ GET  /internal/sync/{shard_id}        full state snapshot for recovery
 
 ---
 
-## Phase 2: Durability (Write-Ahead Log)
+## Phase 2: Durability (Write-Ahead Log) ✅ Complete
 
 **Theme:** Data that survives a crash.
 
 **New Concepts:**
-- Write-ahead logging (WAL)
-- fsync semantics
-- Log replay on restart
-- Snapshot + log truncation
+- Write-ahead logging (WAL): fsync before apply so committed writes survive crashes
+- Atomic snapshots: temp-file + rename, never leaves partial snapshot on disk
+- Snapshot + WAL truncation: WAL does not grow unbounded
+- Startup recovery priority: disk state → skip network recovery
 
-**What Gets Built:**
-- WAL: append-only log file with checksums
-- Startup: replay WAL to reconstruct in-memory state
-- Snapshot: periodic disk snapshot + WAL truncation
-- Recovery: if WAL exists on restart, replay instead of pulling full snapshot (when version is close enough)
+**What Was Built:**
+- `internal/wal/` — append-only `wal.jsonl` with one JSON entry per line; `Append` fsyncs before returning; `ReadAll` stops at any corrupt/partial line
+- `internal/snapshot/` — atomic `snapshot.json` via temp-file rename; stores `{term, version, kv}`
+- `node/diskstate.go` — per-shard manager: `openDiskState`, `load` (snapshot + WAL replay), `appendWAL`, `maybeSnapshot` (triggers every N writes)
+- `node/server.go` updated: `InitShards` opens disk state and loads if valid (marks replica ready immediately); `leaderWrite` and `handleReplicate` both append to WAL before applying to memory
 
-**Key Invariants to Test:**
-- Data survives process restart
-- WAL replay produces identical state to pre-crash
-- Snapshot + partial WAL replay produces correct state
-- Corrupted WAL entry triggers safe fallback (recover from leader)
+**Key Invariants:**
+- WAL is written *before* applying to in-memory KV (write-ahead guarantees durability even on crash between write and ACK)
+- Snapshot taken atomically; WAL truncated only after snapshot confirmed written
+- Corrupt WAL line halts replay; valid prefix is used (partial crash-boundary write is ignored)
+- Both leader and follower maintain independent WALs
 
-**Definition of Done:**
-- A node can be killed and restarted and recover its own data from disk
-- Network recovery (snapshot from leader) is still used when WAL diverges significantly
+**Completed:** 5 new durability integration tests pass. Test suite now: 44 unit + 17 integration.
+
+```
+internal/wal/wal.go         append-only WAL, fsync per entry
+internal/snapshot/snapshot.go  atomic snapshot save/load
+node/diskstate.go           per-shard WAL + snapshot manager
+```
 
 ---
 

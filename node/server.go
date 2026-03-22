@@ -14,6 +14,7 @@ import (
 	"github.com/davecarr1024/doki/coordinator"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
+	"github.com/davecarr1024/doki/internal/wal"
 )
 
 // Server is a leaf node's HTTP server.
@@ -26,10 +27,16 @@ import (
 //   - POST /kv/{shard_id}                  — KV operations (put/get/delete); leader only
 //   - POST /internal/replicate/{shard_id}  — replication fan-out from leader
 //   - GET  /internal/sync/{shard_id}       — full-state sync for recovering followers
+//
+// Phase 2 additions:
+//   - WAL written before every put/delete (leader and follower)
+//   - Periodic snapshot + WAL truncation
+//   - InitShards loads from disk if state exists, skipping network recovery
 type Server struct {
 	cfg             *config.NodeConfig
 	clock           clock.Clock
 	replicas        map[string]*ReplicaState // shard_id → replica
+	diskStates      map[string]*diskState    // shard_id → disk state (WAL + snapshot)
 	nodeAddresses   map[string]string        // nodeID → HTTP address (from coordinator)
 	shardMapVersion uint64
 	mu              sync.RWMutex
@@ -47,14 +54,31 @@ func NewServer(cfg *config.NodeConfig, clk clock.Clock) *Server {
 		cfg:           cfg,
 		clock:         clk,
 		replicas:      make(map[string]*ReplicaState),
+		diskStates:    make(map[string]*diskState),
 		nodeAddresses: make(map[string]string),
 		startedAt:     clk.Now(),
+	}
+}
+
+// Close releases any resources held by the server (e.g. open WAL file handles).
+// Call Close after the server has stopped serving.
+func (s *Server) Close() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, ds := range s.diskStates {
+		if err := ds.close(); err != nil {
+			log.Printf("disk state close error: %v", err)
+		}
 	}
 }
 
 // InitShards creates replica state for each shard this node participates in.
 // The full ShardMapResponse from the coordinator is used so that peer node
 // addresses are available for replication fan-out and recovery.
+//
+// If cfg.DataDir is set, InitShards opens the per-shard disk state and loads
+// any existing WAL/snapshot. Replicas with valid disk state are marked ready
+// immediately, skipping network recovery.
 func (s *Server) InitShards(resp coordinator.ShardMapResponse) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -73,12 +97,39 @@ func (s *Server) InitShards(resp coordinator.ShardMapResponse) {
 		r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers)
 		if shard.Leader == s.cfg.Node.ID {
 			r.Role = RoleLeader
-			r.IsReady = true // leader starts fresh with empty KV; no recovery needed
+			r.IsReady = true // leader starts ready; disk state applied below if available
 		}
 		r.LeaderID = shard.Leader
+
+		// Try to load from disk if a data directory is configured.
+		if s.cfg.DataDir != "" {
+			shardDir := shardDataDir(s.cfg.DataDir, shard.ID)
+			ds, err := openDiskState(shardDir, s.cfg.SnapshotInterval)
+			if err != nil {
+				log.Printf("disk state open failed shard_id=%s err=%v — continuing without disk state", shard.ID, err)
+			} else {
+				s.diskStates[shard.ID] = ds
+				loaded, err := ds.load()
+				if err != nil {
+					log.Printf("disk state load failed shard_id=%s err=%v", shard.ID, err)
+				} else if loaded.Valid {
+					r.KV.ApplySnapshot(loaded.KV)
+					r.Version = loaded.Version
+					r.Term = loaded.Term
+					r.IsReady = true // disk state means we don't need network recovery
+					log.Printf("disk state restored shard_id=%s version=%d term=%d", shard.ID, loaded.Version, loaded.Term)
+				}
+			}
+		}
+
 		s.replicas[shard.ID] = r
-		log.Printf("shard initialized shard_id=%s role=%s leader=%s", shard.ID, r.Role, r.LeaderID)
+		log.Printf("shard initialized shard_id=%s role=%s leader=%s is_ready=%v", shard.ID, r.Role, r.LeaderID, r.IsReady)
 	}
+}
+
+// shardDataDir returns the directory for a shard's WAL and snapshot.
+func shardDataDir(dataDir, shardID string) string {
+	return dataDir + "/shards/" + shardID
 }
 
 // Start begins serving HTTP and runs background goroutines.
@@ -312,6 +363,19 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	replica.mu.Lock()
 	term := replica.Term
 	version := replica.Version + 1
+
+	// Write-Ahead Log: persist to disk before applying in memory.
+	s.mu.RLock()
+	ds := s.diskStates[replica.ShardID]
+	s.mu.RUnlock()
+	if ds != nil {
+		walEntry := walEntryFrom(req.Op, req.Key, req.Value, term, version)
+		if err := ds.appendWAL(walEntry); err != nil {
+			replica.mu.Unlock()
+			return fmt.Errorf("wal append: %w", err)
+		}
+	}
+
 	// Apply locally.
 	switch req.Op {
 	case "put":
@@ -323,6 +387,14 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	// Collect peer addresses while holding the lock.
 	peers := append([]string(nil), replica.Peers...)
 	replica.mu.Unlock()
+
+	// Possibly take a snapshot now that the write is applied.
+	if ds != nil {
+		kv := replica.KV.Snapshot()
+		if err := ds.maybeSnapshot(term, version, kv); err != nil {
+			log.Printf("snapshot failed shard_id=%s err=%v", replica.ShardID, err)
+		}
+	}
 
 	// Determine quorum requirement.
 	// We count the leader as 1; need (quorum-1) follower ACKs.
@@ -391,6 +463,23 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Term: term, Error: "stale term"})
 		return
 	}
+
+	// Write-Ahead Log: persist before applying.
+	s.mu.RLock()
+	ds := s.diskStates[shardID]
+	s.mu.RUnlock()
+	if ds != nil {
+		walEntry := walEntryFrom(req.Op, req.Key, req.Value, req.Term, req.Version)
+		if err := ds.appendWAL(walEntry); err != nil {
+			replica.mu.Unlock()
+			log.Printf("follower wal append failed shard_id=%s err=%v", shardID, err)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusInternalServerError)
+			_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Error: "wal error"})
+			return
+		}
+	}
+
 	// Apply the write.
 	switch req.Op {
 	case "put":
@@ -404,6 +493,14 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	}
 	replica.IsReady = true // receiving replication means we're in sync
 	replica.mu.Unlock()
+
+	// Possibly snapshot after applying.
+	if ds != nil {
+		kv := replica.KV.Snapshot()
+		if err := ds.maybeSnapshot(req.Term, req.Version, kv); err != nil {
+			log.Printf("follower snapshot failed shard_id=%s err=%v", shardID, err)
+		}
+	}
 
 	log.Printf("replicated shard_id=%s op=%s key=%s version=%d", shardID, req.Op, req.Key, req.Version)
 	w.Header().Set("Content-Type", "application/json")
@@ -553,3 +650,14 @@ func (s *Server) refetchShardMap() {
 	s.mu.Unlock()
 }
 
+
+// walEntryFrom builds a wal.Entry from a KV operation's fields.
+func walEntryFrom(op, key, value string, term, version uint64) wal.Entry {
+	return wal.Entry{
+		Term:    term,
+		Version: version,
+		Op:      op,
+		Key:     key,
+		Value:   value,
+	}
+}

@@ -163,6 +163,8 @@ type NodeConfig struct {
 	// How long to wait for quorum ACKs during a write
 	QuorumTimeout   time.Duration `yaml:"-"`
 	QuorumTimeoutMs int           `yaml:"quorum_timeout_ms"`
+	// How many writes between WAL snapshots (0 = use default of 100)
+	SnapshotInterval int `yaml:"snapshot_interval"`
 }
 
 // LoadNodeConfig reads and parses a NodeConfig from a YAML file.
