@@ -159,7 +159,7 @@ func TestHandleReplicate_AppliesWrite(t *testing.T) {
 	req := ReplicateRequest{Term: 1, Version: 1, Op: "put", Key: "hello", Value: "world"}
 	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var rr ReplicateResponse
@@ -180,7 +180,7 @@ func TestHandleReplicate_Delete(t *testing.T) {
 	req := ReplicateRequest{Term: 1, Version: 2, Op: "delete", Key: "gone"}
 	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var rr ReplicateResponse
@@ -202,7 +202,7 @@ func TestHandleReplicate_StaleTerm(t *testing.T) {
 	req := ReplicateRequest{Term: 2, Version: 1, Op: "put", Key: "k", Value: "v"}
 	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var rr ReplicateResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
@@ -218,7 +218,7 @@ func TestHandleReplicate_UnknownShard(t *testing.T) {
 	req := ReplicateRequest{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v"}
 	resp, err := http.Post(ts.URL+"/internal/replicate/no-such-shard", "application/json", jsonBody(req))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
 }
 
@@ -234,7 +234,7 @@ func TestHandleSync_ReturnsSnapshot(t *testing.T) {
 
 	resp, err := http.Get(ts.URL + "/internal/sync/shard-0")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var sr SyncResponse
@@ -250,7 +250,7 @@ func TestHandleSync_NonLeaderRejects(t *testing.T) {
 
 	resp, err := http.Get(ts.URL + "/internal/sync/shard-0")
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 }
 
@@ -266,7 +266,7 @@ func TestHandleKV_PutAndGet_SingleReplica(t *testing.T) {
 	putResp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
 		jsonBody(KVRequest{Op: "put", Key: "name", Value: "alice"}))
 	require.NoError(t, err)
-	defer putResp.Body.Close()
+	defer func() { _ = putResp.Body.Close() }()
 	require.Equal(t, http.StatusOK, putResp.StatusCode)
 
 	var kvr KVResponse
@@ -277,7 +277,7 @@ func TestHandleKV_PutAndGet_SingleReplica(t *testing.T) {
 	getResp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
 		jsonBody(KVRequest{Op: "get", Key: "name"}))
 	require.NoError(t, err)
-	defer getResp.Body.Close()
+	defer func() { _ = getResp.Body.Close() }()
 	require.Equal(t, http.StatusOK, getResp.StatusCode)
 
 	var getKvr KVResponse
@@ -294,7 +294,7 @@ func TestHandleKV_GetMissing(t *testing.T) {
 	resp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
 		jsonBody(KVRequest{Op: "get", Key: "missing"}))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var kvr KVResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&kvr))
@@ -310,7 +310,7 @@ func TestHandleKV_DeleteSingleReplica(t *testing.T) {
 	resp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
 		jsonBody(KVRequest{Op: "delete", Key: "del"}))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	var kvr KVResponse
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&kvr))
@@ -328,7 +328,7 @@ func TestHandleKV_NotLeaderReturnsError(t *testing.T) {
 	resp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
 		jsonBody(KVRequest{Op: "put", Key: "k", Value: "v"}))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusMisdirectedRequest, resp.StatusCode)
 
 	var kvr KVResponse
@@ -367,7 +367,7 @@ func TestHandleKV_PutWithFollowers_QuorumMet(t *testing.T) {
 	resp, err := http.Post(lts.URL+"/kv/shard-0", "application/json",
 		jsonBody(KVRequest{Op: "put", Key: "x", Value: "42"}))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	var kvr KVResponse
@@ -397,7 +397,7 @@ func TestHandleKV_PutWithFollowers_QuorumUnavailable(t *testing.T) {
 	resp, err := http.Post(lts.URL+"/kv/shard-0", "application/json",
 		jsonBody(KVRequest{Op: "put", Key: "k", Value: "v"}))
 	require.NoError(t, err)
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
 
 	var kvr KVResponse

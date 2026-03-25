@@ -96,7 +96,7 @@ func ReadAll(path string) ([]Entry, error) {
 		}
 		return nil, fmt.Errorf("open wal for read %q: %w", path, err)
 	}
-	defer f.Close()
+	defer func() { _ = f.Close() }()
 
 	var entries []Entry
 	scanner := bufio.NewScanner(f)

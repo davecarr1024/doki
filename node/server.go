@@ -587,7 +587,7 @@ func (s *Server) sendHeartbeat() {
 		log.Printf("heartbeat failed node_id=%s err=%v", s.cfg.Node.ID, err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		log.Printf("heartbeat rejected node_id=%s status=%d", s.cfg.Node.ID, resp.StatusCode)
@@ -616,7 +616,7 @@ func (s *Server) refetchShardMap() {
 		log.Printf("shardmap refetch failed node_id=%s err=%v", s.cfg.Node.ID, err)
 		return
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	var smResp coordinator.ShardMapResponse
 	if err := json.NewDecoder(resp.Body).Decode(&smResp); err != nil {
 		log.Printf("shardmap decode failed node_id=%s err=%v", s.cfg.Node.ID, err)

@@ -49,7 +49,7 @@ func fetchShardMap(coordinatorAddr string) (coordinator.ShardMapResponse, error)
 	if err != nil {
 		return coordinator.ShardMapResponse{}, fmt.Errorf("get shard map: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
 		return coordinator.ShardMapResponse{}, fmt.Errorf("shard map request failed: status %d", resp.StatusCode)
 	}

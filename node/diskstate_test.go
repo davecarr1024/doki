@@ -41,7 +41,7 @@ func TestDiskState_AppendAndLoad(t *testing.T) {
 	// Re-open and load.
 	ds2, err := openDiskState(dir, 100)
 	require.NoError(t, err)
-	defer ds2.close()
+	defer func() { _ = ds2.close() }()
 
 	result, err := ds2.load()
 	require.NoError(t, err)
@@ -66,7 +66,7 @@ func TestDiskState_Snapshot_ThenLoad(t *testing.T) {
 	// Re-open and load — should come entirely from snapshot.
 	ds2, err := openDiskState(dir, 100)
 	require.NoError(t, err)
-	defer ds2.close()
+	defer func() { _ = ds2.close() }()
 
 	result, err := ds2.load()
 	require.NoError(t, err)
@@ -90,7 +90,7 @@ func TestDiskState_SnapshotPlusWAL(t *testing.T) {
 
 	ds2, err := openDiskState(dir, 100)
 	require.NoError(t, err)
-	defer ds2.close()
+	defer func() { _ = ds2.close() }()
 
 	result, err := ds2.load()
 	require.NoError(t, err)
@@ -118,7 +118,7 @@ func TestDiskState_WALEntriesBeforeSnapshotAreSkipped(t *testing.T) {
 
 	ds2, err := openDiskState(dir, 100)
 	require.NoError(t, err)
-	defer ds2.close()
+	defer func() { _ = ds2.close() }()
 
 	result, err := ds2.load()
 	require.NoError(t, err)
@@ -141,7 +141,7 @@ func TestDiskState_MaybeSnapshot_Triggers(t *testing.T) {
 	// After snapshot, WAL should be empty, snapshot should exist.
 	ds2, err := openDiskState(dir, 3)
 	require.NoError(t, err)
-	defer ds2.close()
+	defer func() { _ = ds2.close() }()
 
 	result, err := ds2.load()
 	require.NoError(t, err)
