@@ -98,6 +98,32 @@ func (lm *LeaderManager) CheckAndReassign() []string {
 	return changed
 }
 
+// NotifyLeader accepts a distributed election result from a node.
+// It updates the shard map if the reported term is strictly greater than the
+// coordinator's current term for that shard. Returns true if the update was
+// accepted, false if the term was stale or the shard was unknown.
+func (lm *LeaderManager) NotifyLeader(shardID, leaderID string, term uint64) bool {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+
+	currentTerm, ok := lm.terms[shardID]
+	if !ok {
+		return false // unknown shard
+	}
+	if term <= currentTerm {
+		log.Printf("notify_leader rejected shard_id=%s stale_term=%d current_term=%d", shardID, term, currentTerm)
+		return false
+	}
+
+	if err := lm.shards.SetLeader(shardID, leaderID); err != nil {
+		log.Printf("notify_leader set leader failed shard_id=%s err=%v", shardID, err)
+		return false
+	}
+	lm.terms[shardID] = term
+	log.Printf("notify_leader accepted shard_id=%s leader=%s term=%d", shardID, leaderID, term)
+	return true
+}
+
 // pickCandidate selects the best alive non-current-leader replica.
 // Prefers the replica with the highest version for the shard.
 // Returns the chosen node ID and the new term, or ("", 0) if none available.

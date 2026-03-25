@@ -145,34 +145,46 @@ GET /internal/recover/{shard_id}            incremental recovery endpoint
 
 ---
 
-## Phase 4: Distributed Leader Election
+## Phase 4: Distributed Leader Election ✅ Complete
 
 **Theme:** Remove the coordinator as a SPOF for leadership.
 
 **New Concepts:**
-- Leader election via voting
-- Election safety: at most one leader per term
+- Leader election via voting (Raft-like but simplified)
+- Randomised election timeouts to prevent simultaneous elections
 - Vote quorum: majority required to win election
-- Candidate selection: prefer highest-version node
+- Candidate selection: only grant vote if candidate version >= own version
+- Term monotonicity: stale leaders rejected via term comparison
 
-**What Gets Built:**
-- Nodes detect leader failure (missed heartbeats from leader, not just from coordinator)
-- Candidate node initiates an election: sends `RequestVote(term, version)` to peers
-- Peers grant vote if: no vote cast this term AND candidate version >= own version
-- Candidate wins election if majority votes received
-- Elected leader notifies coordinator (coordinator updates shard map)
+**What Was Built:**
+- `node/election.go`: `VoteRequest/Response`, `LeaderHeartbeatRequest/Response`
+- `POST /internal/request_vote/{shard_id}` — peers grant/deny vote based on term, version, and prior vote in this term
+- `POST /internal/leader_heartbeat/{shard_id}` — leader proves liveness to followers; resets follower election timers
+- `runElectionTimer` goroutine — fires election when no leader message received within randomised timeout (default 300–600ms)
+- `runLeaderHeartbeat` goroutine — leader sends heartbeats every `LeaderHeartbeat` (default 150ms)
+- `startElection` — increments term, requests votes, promotes self on quorum, notifies coordinator
+- `notifyCoordinatorElection` — best-effort POST to `POST /notify_leader`; election stands even if coordinator is down
+- Coordinator: `NotifyLeader` in `leader.go` accepts distributed election results if term > current term; `POST /notify_leader` handler in `server.go`
+- `NodeConfig` additions: `LeaderHeartbeatMs`, `ElectionTimeoutMinMs`, `ElectionTimeoutMaxMs`
+- `ReplicaState` additions: `LastLeaderContact`, `VotedFor`, `VotedForTerm`, `ElectionTimeout`
 
 **Design Note:** This is Raft-like but not full Raft. We skip pre-vote, log matching, and some edge cases. The goal is to learn the core election mechanism, not implement production-grade Raft.
 
-**Key Invariants to Test:**
-- Only one winner per election term
-- A stale node (lower version) cannot win election if a more up-to-date node is available
-- Cluster recovers leadership without coordinator involvement
-- No data loss on failover (relies on phase 1+3 correctness)
+**Key Invariants:**
+- At most one vote granted per term per node
+- Nodes with lower version cannot win election over a more up-to-date peer
+- Cluster recovers leadership without coordinator involvement (coordinator notification is best-effort)
+- `handleReplicate` and `handleLeaderHeartbeat` both reset `LastLeaderContact`, proving leader liveness via two paths
 
-**Definition of Done:**
-- Kill coordinator; cluster continues to elect new leaders on node failure
-- Election invariants pass
+**Completed:** 11 new unit tests (election handlers + `startElection`) + 3 election integration tests pass.
+Coordinator notification works: elected leader updates shard map directly; nodes refetch on next heartbeat.
+
+```
+POST /internal/request_vote/{shard_id}      election vote request from candidate
+POST /internal/leader_heartbeat/{shard_id}  leader liveness heartbeat → resets election timer
+POST /notify_leader                         (coordinator) accept distributed election result
+node/election.go                            all Phase 4 election logic
+```
 
 ---
 

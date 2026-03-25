@@ -99,6 +99,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("GET /leader/{shard_id}", s.handleLeaderQuery)
+	// Phase 4: distributed election notification.
+	mux.HandleFunc("POST /notify_leader", s.handleNotifyLeader)
 }
 
 // --- Handlers ---
@@ -226,6 +228,35 @@ func (s *Server) handleReady(w http.ResponseWriter, r *http.Request) {
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ready"})
+}
+
+// NotifyLeaderRequest is the body of POST /notify_leader.
+type NotifyLeaderRequest struct {
+	ShardID  string `json:"shard_id"`
+	LeaderID string `json:"leader_id"`
+	Term     uint64 `json:"term"`
+}
+
+// handleNotifyLeader accepts a distributed election result from a node.
+// Returns 200 OK if accepted, 409 Conflict if the term is stale.
+func (s *Server) handleNotifyLeader(w http.ResponseWriter, r *http.Request) {
+	var req NotifyLeaderRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.ShardID == "" || req.LeaderID == "" || req.Term == 0 {
+		http.Error(w, "missing fields", http.StatusBadRequest)
+		return
+	}
+	if !s.leader.NotifyLeader(req.ShardID, req.LeaderID, req.Term) {
+		http.Error(w, "stale term or unknown shard", http.StatusConflict)
+		return
+	}
+	// SetLeader inside NotifyLeader already incremented the shard map version,
+	// so nodes will refetch on their next heartbeat cycle.
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }
 
 // --- Health monitor ---

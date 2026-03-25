@@ -64,10 +64,10 @@ The project is built incrementally. Know which phase you are in before adding co
 |-------|--------|-------------|
 | 0 | Complete | Infrastructure, health endpoints, heartbeat, scaffolding |
 | 1 | Complete | In-memory KV, replication, quorum writes, snapshot recovery |
-| 2 | **Current** | WAL + durability, disk snapshots, restart recovery |
-| 3 | Planned | Incremental replication log |
-| 4 | Planned | Distributed leader election |
-| 5 | Planned | Dynamic sharding |
+| 2 | Complete | WAL + durability, disk snapshots, restart recovery |
+| 3 | Complete | Incremental replication log |
+| 4 | Complete | Distributed leader election |
+| 5 | **Current** | Dynamic sharding |
 | 6 | Planned | SQL layer |
 
 **Rule:** Do not implement Phase N+1 concepts while working in Phase N.

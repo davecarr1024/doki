@@ -2,6 +2,7 @@ package node
 
 import (
 	"sync"
+	"time"
 
 	"github.com/davecarr1024/doki/internal/replicationlog"
 	"github.com/davecarr1024/doki/internal/storage"
@@ -63,20 +64,39 @@ type ReplicaState struct {
 	// On each committed write, the entry is appended here so that lagging
 	// followers can catch up via log replay instead of a full snapshot.
 	RepLog *replicationlog.Log
+
+	// Phase 4: election state (all protected by mu).
+
+	// LastLeaderContact is the last time a valid leader message was received
+	// (replication or leader heartbeat). Used by the election timer.
+	LastLeaderContact time.Time
+
+	// VotedFor is the candidate this replica voted for in VotedForTerm.
+	VotedFor string
+
+	// VotedForTerm is the term of the last vote granted.
+	VotedForTerm uint64
+
+	// ElectionTimeout is the randomized timeout for this replica.
+	// A new election is triggered when (now - LastLeaderContact) > ElectionTimeout.
+	ElectionTimeout time.Duration
 }
 
 // NewReplicaState creates a new replica in FOLLOWER state, not ready.
 // logSize is the maximum number of entries retained in the replication log;
 // pass 0 to use the default of 1000.
-func NewReplicaState(shardID, nodeID string, peers []string, logSize int) *ReplicaState {
+// electionTimeout is the randomized election timeout for Phase 4; pass 0 to
+// disable election timer behaviour (useful for Phase 0–3 unit tests).
+func NewReplicaState(shardID, nodeID string, peers []string, logSize int, electionTimeout time.Duration) *ReplicaState {
 	return &ReplicaState{
-		ShardID: shardID,
-		NodeID:  nodeID,
-		Role:    RoleFollower,
-		IsReady: false, // becomes ready after initial recovery
-		Peers:   peers,
-		KV:      memory.New(),
-		RepLog:  replicationlog.New(logSize),
+		ShardID:         shardID,
+		NodeID:          nodeID,
+		Role:            RoleFollower,
+		IsReady:         false, // becomes ready after initial recovery
+		Peers:           peers,
+		KV:              memory.New(),
+		RepLog:          replicationlog.New(logSize),
+		ElectionTimeout: electionTimeout,
 	}
 }
 

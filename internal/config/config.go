@@ -169,6 +169,16 @@ type NodeConfig struct {
 	// Followers that lag by more than this many writes receive a full snapshot.
 	// 0 means use the default of 1000.
 	ReplicationLogSize int `yaml:"replication_log_size"`
+	// Phase 4: leader-to-follower heartbeat interval (proves leader is alive, resets election timer).
+	// 0 means use the default of 150ms.
+	LeaderHeartbeatMs int           `yaml:"leader_heartbeat_ms"`
+	LeaderHeartbeat   time.Duration `yaml:"-"`
+	// Phase 4: randomized election timeout range.
+	// 0 means use the default (300ms min, 600ms max).
+	ElectionTimeoutMinMs int           `yaml:"election_timeout_min_ms"`
+	ElectionTimeoutMaxMs int           `yaml:"election_timeout_max_ms"`
+	ElectionTimeoutMin   time.Duration `yaml:"-"`
+	ElectionTimeoutMax   time.Duration `yaml:"-"`
 }
 
 // LoadNodeConfig reads and parses a NodeConfig from a YAML file.
@@ -209,6 +219,18 @@ func (c *NodeConfig) applyDefaults() {
 	if c.ReplicationLogSize == 0 {
 		c.ReplicationLogSize = 1000
 	}
+	if c.LeaderHeartbeatMs == 0 {
+		c.LeaderHeartbeatMs = 150
+	}
+	c.LeaderHeartbeat = time.Duration(c.LeaderHeartbeatMs) * time.Millisecond
+	if c.ElectionTimeoutMinMs == 0 {
+		c.ElectionTimeoutMinMs = 300
+	}
+	if c.ElectionTimeoutMaxMs == 0 {
+		c.ElectionTimeoutMaxMs = 600
+	}
+	c.ElectionTimeoutMin = time.Duration(c.ElectionTimeoutMinMs) * time.Millisecond
+	c.ElectionTimeoutMax = time.Duration(c.ElectionTimeoutMaxMs) * time.Millisecond
 }
 
 // EnsureDefaults fills in zero-value fields with sensible defaults.

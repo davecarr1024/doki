@@ -39,6 +39,12 @@ import (
 //   - GET /internal/recover/{shard_id}      — incremental log-based recovery
 //   - In-memory replication log per replica (bounded circular buffer)
 //   - Recovery tries log-based catch-up first; falls back to full snapshot
+//
+// Phase 4 additions:
+//   - POST /internal/request_vote/{shard_id}     — election vote request
+//   - POST /internal/leader_heartbeat/{shard_id} — leader liveness heartbeat
+//   - Distributed leader election with randomized timeouts
+//   - POST /notify_leader on coordinator — elected leader notifies coordinator
 type Server struct {
 	cfg             *config.NodeConfig
 	clock           clock.Clock
@@ -101,7 +107,7 @@ func (s *Server) InitShards(resp coordinator.ShardMapResponse) {
 				peers = append(peers, r)
 			}
 		}
-		r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers, s.cfg.ReplicationLogSize)
+		r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers, s.cfg.ReplicationLogSize, s.electionTimeout())
 		if shard.Leader == s.cfg.Node.ID {
 			r.Role = RoleLeader
 			r.IsReady = true // leader starts ready; disk state applied below if available
@@ -183,15 +189,24 @@ func (s *Server) StartOnListener(ctx context.Context, l net.Listener) error {
 
 func (s *Server) startBackgroundJobs(ctx context.Context) {
 	go s.runHeartbeat(ctx)
-	// Start recovery loops for follower replicas that are not yet ready.
+	// Start per-replica background goroutines.
 	s.mu.RLock()
 	for _, r := range s.replicas {
+		r := r
+		// Seed the election timer so the replica doesn't immediately call an
+		// election before the initial shard map is fully distributed.
+		r.mu.Lock()
+		r.LastLeaderContact = s.clock.Now()
+		r.mu.Unlock()
+		// Phase 3: incremental recovery for not-ready followers.
 		if r.Role == RoleFollower && !r.IsReady {
-			r := r
 			go runRecoveryLoop(ctx, r, func() string {
 				return s.leaderAddrForReplica(r)
 			})
 		}
+		// Phase 4: election timer and leader heartbeat run for every replica.
+		go s.runElectionTimer(ctx, r)
+		go s.runLeaderHeartbeat(ctx, r)
 	}
 	s.mu.RUnlock()
 }
@@ -218,6 +233,9 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /internal/replicate/{shard_id}", s.handleReplicate)
 	mux.HandleFunc("GET /internal/sync/{shard_id}", s.handleSync)
 	mux.HandleFunc("GET /internal/recover/{shard_id}", s.handleRecover)
+	// Phase 4: distributed election endpoints.
+	mux.HandleFunc("POST /internal/request_vote/{shard_id}", s.handleRequestVote)
+	mux.HandleFunc("POST /internal/leader_heartbeat/{shard_id}", s.handleLeaderHeartbeat)
 }
 
 // Handler builds and returns the HTTP handler for this server.
@@ -519,6 +537,8 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		replica.Term = req.Term
 	}
 	replica.IsReady = true // receiving replication means we're in sync
+	// Phase 4: valid replication from leader proves leader is alive; reset election timer.
+	replica.LastLeaderContact = s.clock.Now()
 	// Append to replication log so that if this follower is later promoted to
 	// leader it can serve incremental recovery without having an empty log.
 	replica.RepLog.Append(replicationlog.Entry{
@@ -751,6 +771,8 @@ func (s *Server) refetchShardMap() {
 		}
 		if r.LeaderID != oldLeader {
 			log.Printf("leader changed shard_id=%s old=%s new=%s", shard.ID, oldLeader, r.LeaderID)
+			// Phase 4: learning about a new leader resets the election timer.
+			r.LastLeaderContact = s.clock.Now()
 		}
 		r.mu.Unlock()
 	}
