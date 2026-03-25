@@ -3,6 +3,7 @@ package node
 import (
 	"sync"
 
+	"github.com/davecarr1024/doki/internal/replicationlog"
 	"github.com/davecarr1024/doki/internal/storage"
 	"github.com/davecarr1024/doki/internal/storage/memory"
 )
@@ -57,10 +58,17 @@ type ReplicaState struct {
 
 	// KV is the storage engine for this replica.
 	KV storage.Storage
+
+	// RepLog is the bounded in-memory replication log.
+	// On each committed write, the entry is appended here so that lagging
+	// followers can catch up via log replay instead of a full snapshot.
+	RepLog *replicationlog.Log
 }
 
 // NewReplicaState creates a new replica in FOLLOWER state, not ready.
-func NewReplicaState(shardID, nodeID string, peers []string) *ReplicaState {
+// logSize is the maximum number of entries retained in the replication log;
+// pass 0 to use the default of 1000.
+func NewReplicaState(shardID, nodeID string, peers []string, logSize int) *ReplicaState {
 	return &ReplicaState{
 		ShardID: shardID,
 		NodeID:  nodeID,
@@ -68,6 +76,7 @@ func NewReplicaState(shardID, nodeID string, peers []string) *ReplicaState {
 		IsReady: false, // becomes ready after initial recovery
 		Peers:   peers,
 		KV:      memory.New(),
+		RepLog:  replicationlog.New(logSize),
 	}
 }
 

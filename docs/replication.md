@@ -84,7 +84,7 @@ sequenceDiagram
     A->>A: apply locally
     A-->>CL: OK
 
-    note over C: C recovers later via full snapshot
+    note over C: C recovers via incremental log or full snapshot (Phase 3)
 ```
 
 ### Write Failure (Quorum Unavailable)
@@ -216,7 +216,9 @@ flowchart TD
     H --> I[Apply any buffered writes\nwith version > snapshot.version]
 ```
 
-### Recovery Protocol
+### Recovery Protocol (Phase 3: Incremental Log)
+
+The default recovery path uses the leader's in-memory replication log to avoid full snapshot transfers for small gaps.
 
 ```mermaid
 sequenceDiagram
@@ -227,22 +229,24 @@ sequenceDiagram
     R->>CO: GET /shardmap
     CO-->>R: {leader: "node-a"}
 
-    R->>L: SyncRequest(shard_id)
-    note over L: pause writes briefly\ntake snapshot
+    note over R: current version = 140
+    R->>L: GET /internal/recover/shard-0?since_version=140
 
-    loop stream chunks
-        L-->>R: SnapshotChunk{term=4, version=142, entries=batch}
+    alt log covers the gap (version 141–144 in log)
+        L-->>R: {type:"entries", version:144, entries:[v141,v142,v143,v144]}
+        note over R: apply entries 141-144<br/>version=144, is_ready=true
+    else gap too large (entries evicted)
+        L-->>R: {type:"snapshot", version:144, kv:{...}}
+        note over R: apply full snapshot<br/>version=144, is_ready=true
     end
-    L-->>R: SnapshotChunk{is_last=true}
 
-    note over R: apply snapshot atomically<br/>version=142, term=4<br/>is_ready=true
-
-    note over L: send buffered writes (v>142)
-    L->>R: Replicate(v=143, ...)
-    R-->>L: ACK
-    L->>R: Replicate(v=144, ...)
+    note over L: future writes replicate normally
+    L->>R: Replicate(v=145, ...)
     R-->>L: ACK
 ```
+
+**Log size default:** 1000 entries (configurable via `replication_log_size` in node config).
+**Fallback:** full snapshot when the follower's `since_version` is more than `replication_log_size` writes behind the leader.
 
 ### Snapshot Streaming
 
@@ -327,3 +331,4 @@ stateDiagram-v2
 | `max_lag_versions` | 1000 | Versions behind before triggering recovery |
 | `max_buffered_versions` | 100 | Write buffer size during follower recovery |
 | `snapshot_chunk_size` | 1000 | KV entries per snapshot chunk |
+| `replication_log_size` | 1000 | Max entries in in-memory replication log |

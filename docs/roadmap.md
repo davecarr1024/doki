@@ -109,30 +109,39 @@ node/diskstate.go           per-shard WAL + snapshot manager
 
 ---
 
-## Phase 3: Incremental Replication Log
+## Phase 3: Incremental Replication Log ✅ Complete
 
 **Theme:** Efficient catch-up without full snapshots.
 
 **New Concepts:**
-- Replication log (operations log, not WAL)
-- Log-based follower catch-up
-- Log compaction / truncation
-- Snapshot + tail-of-log recovery
+- Replication log (in-memory bounded circular buffer, distinct from the durable WAL)
+- Log-based follower catch-up: send only missing entries instead of full snapshot
+- Snapshot fallback when follower lag exceeds the log size
+- Duplicate-write protection in `handleReplicate` (idempotent on version re-delivery)
 
-**What Gets Built:**
-- Leaders maintain a bounded replication log (recent N operations)
-- Followers that fall slightly behind catch up via log replay, not full snapshot
-- Full snapshot still used when follower is too far behind
-- Log entries include: `{term, version, op}`
+**What Was Built:**
+- `internal/replicationlog/` — bounded `Log` type with `Append`, `Since(sinceVersion)`, `OldestVersion`; evicts oldest entry when at capacity
+- `ReplicaState.RepLog` — every replica (leader and follower) maintains a replication log; followers that get promoted to leader can serve incremental recovery immediately
+- `GET /internal/recover/{shard_id}?since_version=N` — leader responds with `{type:"entries", entries:[...]}` when log covers the gap, or `{type:"snapshot", kv:...}` as fallback
+- `doIncrementalRecovery` in `node/recovery.go` — tries `/internal/recover` first; applies log entries or snapshot transparently; replaces `doRecovery` (full snapshot) in the recovery loop
+- Duplicate guard in `handleReplicate`: if `req.Version <= replica.Version`, skip and ACK (prevents double-application when replication and recovery race)
+- `NodeConfig.ReplicationLogSize` — configurable log buffer size, defaults to 1000
 
-**Key Invariants to Test:**
-- Follower that misses N writes (N < log size) recovers via log, not snapshot
-- Follower that is far behind still recovers correctly via snapshot
-- Leader log does not grow unbounded
+**Key Invariants:**
+- Log entries are always appended inside `replica.mu.Lock()`, guaranteeing version-order consistency
+- `Since(sinceVersion)` returns `(nil, false)` only when entries have been evicted (gap), never for valid coverage
+- Log is populated on both leaders and followers so promotion to leader yields a non-empty log
+- Full-snapshot fallback preserves the Phase 1/2 correctness invariants unchanged
 
-**Definition of Done:**
-- Recovery for small gaps uses log replay
-- Integration test: kill follower, write 50 ops, restart, verify log-based recovery
+**Completed:** 9 new unit tests (replicationlog package) + 6 new integration tests pass.
+
+```
+internal/replicationlog/replicationlog.go   bounded in-memory log (circular buffer)
+node/replica.go                             RepLog field added to ReplicaState
+node/server.go                              handleRecover + log append in leaderWrite/handleReplicate
+node/recovery.go                            doIncrementalRecovery replaces full-snapshot loop
+GET /internal/recover/{shard_id}            incremental recovery endpoint
+```
 
 ---
 

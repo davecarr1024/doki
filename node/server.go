@@ -8,12 +8,14 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/davecarr1024/doki/coordinator"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
+	"github.com/davecarr1024/doki/internal/replicationlog"
 	"github.com/davecarr1024/doki/internal/wal"
 )
 
@@ -32,6 +34,11 @@ import (
 //   - WAL written before every put/delete (leader and follower)
 //   - Periodic snapshot + WAL truncation
 //   - InitShards loads from disk if state exists, skipping network recovery
+//
+// Phase 3 additions:
+//   - GET /internal/recover/{shard_id}      — incremental log-based recovery
+//   - In-memory replication log per replica (bounded circular buffer)
+//   - Recovery tries log-based catch-up first; falls back to full snapshot
 type Server struct {
 	cfg             *config.NodeConfig
 	clock           clock.Clock
@@ -94,7 +101,7 @@ func (s *Server) InitShards(resp coordinator.ShardMapResponse) {
 				peers = append(peers, r)
 			}
 		}
-		r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers)
+		r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers, s.cfg.ReplicationLogSize)
 		if shard.Leader == s.cfg.Node.ID {
 			r.Role = RoleLeader
 			r.IsReady = true // leader starts ready; disk state applied below if available
@@ -210,6 +217,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /kv/{shard_id}", s.handleKV)
 	mux.HandleFunc("POST /internal/replicate/{shard_id}", s.handleReplicate)
 	mux.HandleFunc("GET /internal/sync/{shard_id}", s.handleSync)
+	mux.HandleFunc("GET /internal/recover/{shard_id}", s.handleRecover)
 }
 
 // Handler builds and returns the HTTP handler for this server.
@@ -384,6 +392,15 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 		replica.KV.Delete(req.Key)
 	}
 	replica.Version = version
+	// Append to replication log while still holding the lock so entries
+	// are always recorded in version order.
+	replica.RepLog.Append(replicationlog.Entry{
+		Term:    term,
+		Version: version,
+		Op:      req.Op,
+		Key:     req.Key,
+		Value:   req.Value,
+	})
 	// Collect peer addresses while holding the lock.
 	peers := append([]string(nil), replica.Peers...)
 	replica.mu.Unlock()
@@ -480,6 +497,16 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Ignore duplicates: if we already have this version (e.g. received via
+	// incremental recovery and replication concurrently), skip silently.
+	if req.Version <= replica.Version {
+		term := replica.Term
+		replica.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: term})
+		return
+	}
+
 	// Apply the write.
 	switch req.Op {
 	case "put":
@@ -492,6 +519,15 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		replica.Term = req.Term
 	}
 	replica.IsReady = true // receiving replication means we're in sync
+	// Append to replication log so that if this follower is later promoted to
+	// leader it can serve incremental recovery without having an empty log.
+	replica.RepLog.Append(replicationlog.Entry{
+		Term:    req.Term,
+		Version: req.Version,
+		Op:      req.Op,
+		Key:     req.Key,
+		Value:   req.Value,
+	})
 	replica.mu.Unlock()
 
 	// Possibly snapshot after applying.
@@ -537,6 +573,77 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		Version: version,
 		KV:      kv,
 	})
+}
+
+// RecoverResponse is returned by GET /internal/recover/{shard_id}.
+// Type is "entries" when the log covers the requested gap, or "snapshot"
+// when the follower is too far behind and must rebuild from a full snapshot.
+type RecoverResponse struct {
+	Type    string                 `json:"type"`              // "entries" or "snapshot"
+	Version uint64                 `json:"version"`           // leader version at response time
+	Entries []replicationlog.Entry `json:"entries,omitempty"` // for type="entries"
+	Term    uint64                 `json:"term,omitempty"`    // for type="snapshot"
+	KV      map[string]string      `json:"kv,omitempty"`      // for type="snapshot"
+}
+
+// handleRecover handles GET /internal/recover/{shard_id}?since_version=N.
+//
+// Phase 3 incremental recovery: if the log covers the follower's gap the leader
+// sends only the missing entries. Otherwise it falls back to a full snapshot.
+// Only the leader serves this endpoint.
+func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
+	shardID := r.PathValue("shard_id")
+	sinceVersion, _ := strconv.ParseUint(r.URL.Query().Get("since_version"), 10, 64)
+
+	s.mu.RLock()
+	replica := s.replicas[shardID]
+	s.mu.RUnlock()
+
+	if replica == nil {
+		http.Error(w, "shard not found", http.StatusNotFound)
+		return
+	}
+
+	replica.mu.RLock()
+	if replica.Role != RoleLeader {
+		replica.mu.RUnlock()
+		http.Error(w, "not leader", http.StatusServiceUnavailable)
+		return
+	}
+	leaderVersion := replica.Version
+	term := replica.Term
+
+	var resp RecoverResponse
+	resp.Version = leaderVersion
+
+	if leaderVersion == sinceVersion {
+		// Follower is already up to date.
+		replica.mu.RUnlock()
+		resp.Type = "entries"
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	entries, ok := replica.RepLog.Since(sinceVersion)
+	if ok && (len(entries) > 0 || leaderVersion == sinceVersion) {
+		// Log covers the gap: send entries.
+		replica.mu.RUnlock()
+		resp.Type = "entries"
+		resp.Entries = entries
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(resp)
+		return
+	}
+
+	// Gap too large or log empty with leader ahead: send full snapshot.
+	kv := replica.KV.Snapshot()
+	replica.mu.RUnlock()
+	resp.Type = "snapshot"
+	resp.Term = term
+	resp.KV = kv
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
 // --- Heartbeat ---

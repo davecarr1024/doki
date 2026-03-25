@@ -165,6 +165,10 @@ type NodeConfig struct {
 	QuorumTimeoutMs int           `yaml:"quorum_timeout_ms"`
 	// How many writes between WAL snapshots (0 = use default of 100)
 	SnapshotInterval int `yaml:"snapshot_interval"`
+	// Maximum number of entries retained in the in-memory replication log.
+	// Followers that lag by more than this many writes receive a full snapshot.
+	// 0 means use the default of 1000.
+	ReplicationLogSize int `yaml:"replication_log_size"`
 }
 
 // LoadNodeConfig reads and parses a NodeConfig from a YAML file.
@@ -202,8 +206,8 @@ func (c *NodeConfig) applyDefaults() {
 	if c.QuorumTimeout == 0 {
 		c.QuorumTimeout = time.Duration(c.QuorumTimeoutMs) * time.Millisecond
 	}
-	if c.DataDir == "" {
-		c.DataDir = "/data"
+	if c.ReplicationLogSize == 0 {
+		c.ReplicationLogSize = 1000
 	}
 }
 
