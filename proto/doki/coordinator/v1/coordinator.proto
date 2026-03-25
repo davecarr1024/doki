@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package doki.coordinator.v1;
 
-import "common.proto";
+import "doki/common/v1/common.proto";
 
 option go_package = "github.com/davecarr1024/doki/gen/proto/coordinator/v1;coordinatorv1";
 
