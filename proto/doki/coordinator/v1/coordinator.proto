@@ -27,7 +27,7 @@ service CoordinatorService {
   rpc WhereIsLeader(WhereIsLeaderRequest) returns (WhereIsLeaderResponse);
 
   // GetStatus returns a full cluster health summary.
-  rpc GetStatus(GetStatusRequest) returns (CoordinatorStatus);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 }
 
 // --- Heartbeat ---
@@ -79,7 +79,7 @@ message NodeHealthEntry {
   int64 last_heartbeat_ms = 4;  // milliseconds since last heartbeat; -1 if never
 }
 
-message CoordinatorStatus {
+message GetStatusResponse {
   uint64 shard_map_version = 1;
   repeated NodeHealthEntry nodes = 2;
   repeated doki.common.v1.ShardInfo shards = 3;

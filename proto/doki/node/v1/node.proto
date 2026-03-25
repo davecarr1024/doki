@@ -30,7 +30,7 @@ service NodeService {
   rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
 
   // SyncState streams a full-state snapshot from leader to a recovering follower.
-  rpc SyncState(SyncRequest) returns (stream SnapshotChunk);
+  rpc SyncState(SyncStateRequest) returns (stream SyncStateResponse);
 
   // --- Control (coordinator → node) ---
 
@@ -43,7 +43,7 @@ service NodeService {
   // --- Observability ---
 
   // GetStatus returns the node's current status for all hosted shards.
-  rpc GetStatus(GetStatusRequest) returns (NodeStatus);
+  rpc GetStatus(GetStatusRequest) returns (GetStatusResponse);
 }
 
 // --- Put ---
@@ -121,13 +121,13 @@ message ReplicateResponse {
 
 // --- SyncState (snapshot recovery) ---
 
-message SyncRequest {
+message SyncStateRequest {
   string shard_id = 1;
 }
 
-// SnapshotChunk is one piece of the full-state snapshot stream.
+// SyncStateResponse is one piece of the full-state snapshot stream.
 // The receiver accumulates chunks until is_last=true, then applies atomically.
-message SnapshotChunk {
+message SyncStateResponse {
   string shard_id = 1;
   uint64 term = 2;
   uint64 final_version = 3;  // shard version at snapshot time
@@ -137,6 +137,7 @@ message SnapshotChunk {
 }
 
 // --- AssignLeader ---
+
 
 message AssignLeaderRequest {
   string shard_id = 1;
@@ -169,7 +170,7 @@ message ShardStatus {
   map<string, uint64> peer_versions = 7;  // leader only: follower versions
 }
 
-message NodeStatus {
+message GetStatusResponse {
   string node_id = 1;
   double uptime_seconds = 2;
   repeated ShardStatus shards = 3;
