@@ -11,6 +11,7 @@ import (
 
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
+	"github.com/davecarr1024/doki/internal/metrics"
 	"github.com/davecarr1024/doki/internal/shardmap"
 )
 
@@ -22,12 +23,19 @@ import (
 //   - GET  /status         — cluster health overview
 //   - GET  /ready          — readiness probe
 //   - GET  /leader/{shard} — direct leader lookup for a shard
+//
+// Phase 4 additions:
+//   - POST /notify_leader  — distributed election notification
+//
+// Reliability additions:
+//   - GET /metrics         — Prometheus metrics
 type Server struct {
 	cfg        *config.ClusterConfig
 	membership *Membership
 	shards     *shardmap.ShardMap
 	leader     *LeaderManager
 	clock      clock.Clock
+	m          *metrics.CoordinatorMetrics
 	httpServer *http.Server
 	ready      bool
 }
@@ -43,8 +51,12 @@ func NewServer(cfg *config.ClusterConfig, clk clock.Clock) *Server {
 		shards:     shards,
 		leader:     leader,
 		clock:      clk,
+		m:          metrics.NewCoordinatorMetrics(),
 	}
 }
+
+// Metrics returns the coordinator's Prometheus registry for use in tests.
+func (s *Server) Metrics() *metrics.CoordinatorMetrics { return s.m }
 
 // Init populates the shard map from config and marks the server as ready.
 func (s *Server) Init() error {
@@ -101,6 +113,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /leader/{shard_id}", s.handleLeaderQuery)
 	// Phase 4: distributed election notification.
 	mux.HandleFunc("POST /notify_leader", s.handleNotifyLeader)
+	// Reliability: Prometheus metrics.
+	mux.Handle("GET /metrics", s.m.Handler())
 }
 
 // --- Handlers ---
@@ -116,6 +130,7 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
+	s.m.HeartbeatReceivedTotal.WithLabelValues(req.NodeID).Inc()
 	smVersion, _ := s.shards.Snapshot()
 	resp := HeartbeatResponse{ShardMapVersion: smVersion}
 	w.Header().Set("Content-Type", "application/json")
@@ -188,11 +203,20 @@ type NodeStatusResponse struct {
 	LastHeartbeatMs int64  `json:"last_heartbeat_ms"`
 }
 
+// ShardStatusResponse is the extended per-shard view in coordinator status.
+type ShardStatusResponse struct {
+	shardmap.ShardInfo
+	Term              uint64            `json:"term"`
+	QuorumAlive       bool              `json:"quorum_alive"`
+	ReplicaVersions   map[string]uint64 `json:"replica_versions"`
+	MaxReplicationLag uint64            `json:"max_replication_lag"`
+}
+
 // CoordinatorStatusResponse is the full body of GET /status.
 type CoordinatorStatusResponse struct {
-	ShardMapVersion uint64               `json:"shard_map_version"`
-	Nodes           []NodeStatusResponse `json:"nodes"`
-	Shards          []shardmap.ShardInfo `json:"shards"`
+	ShardMapVersion uint64                `json:"shard_map_version"`
+	Nodes           []NodeStatusResponse  `json:"nodes"`
+	Shards          []ShardStatusResponse `json:"shards"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -212,10 +236,50 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	version, shards := s.shards.Snapshot()
+
+	// Build alive-node set for quorum calculation.
+	aliveNodes := make(map[string]bool, len(nodeStatuses))
+	for _, ns := range nodeStatuses {
+		if ns.IsAlive {
+			aliveNodes[ns.ID] = true
+		}
+	}
+
+	shardResps := make([]ShardStatusResponse, len(shards))
+	for i, sh := range shards {
+		replicaVersions := make(map[string]uint64, len(sh.Replicas))
+		var leaderVersion uint64
+		for _, rep := range sh.Replicas {
+			v := s.membership.VersionForShard(rep, sh.ID)
+			replicaVersions[rep] = v
+			if rep == sh.Leader {
+				leaderVersion = v
+			}
+		}
+		var maxLag uint64
+		aliveCount := 0
+		for _, rep := range sh.Replicas {
+			if aliveNodes[rep] {
+				aliveCount++
+			}
+			v := replicaVersions[rep]
+			if leaderVersion > v && leaderVersion-v > maxLag {
+				maxLag = leaderVersion - v
+			}
+		}
+		shardResps[i] = ShardStatusResponse{
+			ShardInfo:         sh,
+			Term:              s.leader.TermForShard(sh.ID),
+			QuorumAlive:       aliveCount >= sh.Quorum(),
+			ReplicaVersions:   replicaVersions,
+			MaxReplicationLag: maxLag,
+		}
+	}
+
 	resp := CoordinatorStatusResponse{
 		ShardMapVersion: version,
 		Nodes:           nodeResps,
-		Shards:          shards,
+		Shards:          shardResps,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -250,9 +314,11 @@ func (s *Server) handleNotifyLeader(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !s.leader.NotifyLeader(req.ShardID, req.LeaderID, req.Term) {
+		s.m.NotifyLeaderTotal.WithLabelValues("rejected").Inc()
 		http.Error(w, "stale term or unknown shard", http.StatusConflict)
 		return
 	}
+	s.m.NotifyLeaderTotal.WithLabelValues("accepted").Inc()
 	// SetLeader inside NotifyLeader already incremented the shard map version,
 	// so nodes will refetch on their next heartbeat cycle.
 	w.Header().Set("Content-Type", "application/json")
@@ -278,8 +344,50 @@ func (s *Server) runHealthMonitor(ctx context.Context) {
 						log.Printf("node failure detected node_id=%s", ns.ID)
 					}
 				}
-				s.leader.CheckAndReassign()
+				reassigned := s.leader.CheckAndReassign()
+				for _, shardID := range reassigned {
+					s.m.LeaderReassignmentsTotal.WithLabelValues(shardID).Inc()
+				}
+			}
+			s.refreshMetrics()
+		}
+	}
+}
+
+// refreshMetrics updates coordinator gauges from current cluster state.
+// Called on every health monitor tick so metrics stay current.
+func (s *Server) refreshMetrics() {
+	_, shards := s.shards.Snapshot()
+	nodes := s.membership.All()
+
+	var withLeader, quorumAvail float64
+	for _, sh := range shards {
+		if sh.Leader != "" {
+			withLeader++
+		}
+		alive := 0
+		for _, repID := range sh.Replicas {
+			for _, ns := range nodes {
+				if ns.ID == repID && ns.IsAlive {
+					alive++
+					break
+				}
 			}
 		}
+		if alive >= sh.Quorum() {
+			quorumAvail++
+		}
+		s.m.ShardTerm.WithLabelValues(sh.ID).Set(float64(s.leader.TermForShard(sh.ID)))
+	}
+	s.m.ShardsTotal.Set(float64(len(shards)))
+	s.m.ShardsWithLeader.Set(withLeader)
+	s.m.ShardsQuorumAvailable.Set(quorumAvail)
+
+	for _, ns := range nodes {
+		v := 0.0
+		if ns.IsAlive {
+			v = 1.0
+		}
+		s.m.NodeAlive.WithLabelValues(ns.ID).Set(v)
 	}
 }

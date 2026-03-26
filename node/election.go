@@ -223,6 +223,8 @@ func (s *Server) startElection(ctx context.Context, replica *ReplicaState) {
 	}
 
 	if votes < quorum {
+		s.m.ElectionsTotal.WithLabelValues(shardID, "lost").Inc()
+		replica.ElectionCount.Add(1)
 		log.Printf("election lost shard_id=%s term=%d votes=%d/%d",
 			shardID, candidateTerm, votes, quorum)
 		replica.mu.Unlock()
@@ -234,8 +236,10 @@ func (s *Server) startElection(ctx context.Context, replica *ReplicaState) {
 	replica.LeaderID = nodeID
 	replica.IsReady = true
 	replica.LastLeaderContact = s.clock.Now()
+	replica.ElectionCount.Add(1)
 	replica.mu.Unlock()
 
+	s.m.ElectionsTotal.WithLabelValues(shardID, "won").Inc()
 	log.Printf("election won shard_id=%s node_id=%s term=%d votes=%d/%d",
 		shardID, nodeID, candidateTerm, votes, quorum)
 
@@ -371,9 +375,13 @@ func (s *Server) runLeaderHeartbeat(ctx context.Context, replica *ReplicaState) 
 			for _, addr := range peerAddrs {
 				addr := addr
 				go func() {
+					s.m.LeaderHeartbeatsSentTotal.WithLabelValues(shardID).Inc()
 					peerTerm := sendLeaderHeartbeat(ctx, addr, shardID, hbReq, s.cfg.LeaderHeartbeat/2)
-					if peerTerm > term {
+					if peerTerm == 0 {
+						s.m.LeaderHeartbeatsMissedTotal.WithLabelValues(shardID).Inc()
+					} else if peerTerm > term {
 						// Step down; a higher term exists.
+						s.m.ElectionsTotal.WithLabelValues(shardID, "stepped_down").Inc()
 						replica.mu.Lock()
 						if peerTerm > replica.Term {
 							replica.Term = peerTerm

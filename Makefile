@@ -1,4 +1,4 @@
-.PHONY: all build test test-int lint proto docker-build up down clean deps
+.PHONY: all build test test-int test-chaos test-load test-reliability lint proto docker-build up down clean deps
 
 # Default target
 all: build test
@@ -19,6 +19,18 @@ test-int:
 
 # Run all tests
 test-all: test test-int
+
+# Run chaos tests only (subset of reliability)
+test-chaos:
+	go test ./test/reliability/... -count=1 -timeout=120s -v -tags=reliability -run TestChaos
+
+# Run load tests only (subset of reliability)
+test-load:
+	go test ./test/reliability/... -count=1 -timeout=120s -v -tags=reliability -run TestLoad
+
+# Run all reliability tests (chaos + load + monkey)
+test-reliability:
+	go test ./test/reliability/... -count=1 -timeout=300s -v -tags=reliability
 
 # Run linter
 lint:

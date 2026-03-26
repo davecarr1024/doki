@@ -7,15 +7,18 @@ Doki is a learning-focused distributed database. This guide covers everything ne
 ## Quick Commands
 
 ```bash
-make build        # compile all binaries
-make test         # run all unit tests
-make test-int     # run integration tests (starts real servers)
-make proto        # regenerate protobuf code (requires buf)
-make lint         # run golangci-lint
-make docker-build # build Docker images
-make up           # docker compose up
-make down         # docker compose down
-make clean        # remove build artifacts
+make build            # compile all binaries
+make test             # run all unit tests
+make test-int         # run integration tests (starts real servers)
+make test-chaos       # run chaos scenarios (fault injection)
+make test-load        # run load / throughput tests
+make test-reliability # run full reliability suite (chaos + load + monkey)
+make proto            # regenerate protobuf code (requires buf)
+make lint             # run golangci-lint
+make docker-build     # build Docker images
+make up               # docker compose up
+make down             # docker compose down
+make clean            # remove build artifacts
 ```
 
 ---
@@ -48,7 +51,9 @@ doki/
 │   ├── replica.go                  # Per-shard replica state
 │   └── server.go                   # HTTP server + handlers
 ├── test/
-│   └── integration/                # Integration tests (real servers, no Docker)
+│   ├── integration/                # Integration tests (real servers, no Docker)
+│   ├── reliability/                # Chaos, load, and monkey tests (build tag: reliability)
+│   └── baselines/                  # Persisted load test results for regression tracking
 ├── config/                         # Example YAML configs
 ├── docker/                         # Dockerfiles
 └── docs/                           # Design documentation
@@ -112,7 +117,22 @@ If you change the replication or recovery code, verify all five invariants still
 
 - Unit tests: no network, no goroutines that outlive the test, use `FakeClock`
 - Integration tests: use real servers on random ports (`:0`), real goroutines, real timers
+- Reliability tests: use `//go:build reliability` tag; run with `make test-reliability`
 - Always use `t.Cleanup()` to stop servers, not `defer` in loops
+
+### Definition of Done (per feature)
+
+Before a feature is considered complete, verify the following checklist:
+
+- [ ] Unit tests cover the happy path and key error paths
+- [ ] Integration tests cover cross-process interactions
+- [ ] `AssertNoSplitBrain` passes under the feature's failure modes
+- [ ] `AssertAllCommittedWritesSurvive` passes after leader failover
+- [ ] New Prometheus metrics added for observability (counters, gauges, histograms)
+- [ ] `/status` endpoints updated if new state is relevant to operators
+- [ ] Relevant chaos scenario passes (`make test-chaos`)
+- [ ] Load test shows no regression vs. recorded baseline (`make test-load`)
+- [ ] `docs/` updated if the protocol or architecture changed
 
 ### Logging
 

@@ -15,6 +15,7 @@ import (
 	"github.com/davecarr1024/doki/coordinator"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
+	"github.com/davecarr1024/doki/internal/metrics"
 	"github.com/davecarr1024/doki/internal/replicationlog"
 	"github.com/davecarr1024/doki/internal/wal"
 )
@@ -48,6 +49,7 @@ import (
 type Server struct {
 	cfg             *config.NodeConfig
 	clock           clock.Clock
+	m               *metrics.NodeMetrics
 	replicas        map[string]*ReplicaState // shard_id → replica
 	diskStates      map[string]*diskState    // shard_id → disk state (WAL + snapshot)
 	nodeAddresses   map[string]string        // nodeID → HTTP address (from coordinator)
@@ -66,12 +68,16 @@ func NewServer(cfg *config.NodeConfig, clk clock.Clock) *Server {
 	return &Server{
 		cfg:           cfg,
 		clock:         clk,
+		m:             metrics.NewNodeMetrics(),
 		replicas:      make(map[string]*ReplicaState),
 		diskStates:    make(map[string]*diskState),
 		nodeAddresses: make(map[string]string),
 		startedAt:     clk.Now(),
 	}
 }
+
+// Metrics returns the node's Prometheus registry for use in tests.
+func (s *Server) Metrics() *metrics.NodeMetrics { return s.m }
 
 // Close releases any resources held by the server (e.g. open WAL file handles).
 // Call Close after the server has stopped serving.
@@ -202,13 +208,55 @@ func (s *Server) startBackgroundJobs(ctx context.Context) {
 		if r.Role == RoleFollower && !r.IsReady {
 			go runRecoveryLoop(ctx, r, func() string {
 				return s.leaderAddrForReplica(r)
-			})
+			}, s.m)
 		}
 		// Phase 4: election timer and leader heartbeat run for every replica.
 		go s.runElectionTimer(ctx, r)
 		go s.runLeaderHeartbeat(ctx, r)
 	}
 	s.mu.RUnlock()
+	// Reliability: update staleness gauges and replica version/term gauges.
+	go s.runMetricsUpdater(ctx)
+}
+
+// runMetricsUpdater periodically refreshes replica-level Prometheus gauges.
+func (s *Server) runMetricsUpdater(ctx context.Context) {
+	ticker := time.NewTicker(200 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.refreshReplicaMetrics()
+		}
+	}
+}
+
+// refreshReplicaMetrics updates version, term, leader, and staleness gauges.
+func (s *Server) refreshReplicaMetrics() {
+	now := s.clock.Now()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, r := range s.replicas {
+		r.mu.RLock()
+		isLeader := 0.0
+		if r.Role == RoleLeader {
+			isLeader = 1.0
+		}
+		version := r.Version
+		term := r.Term
+		lastContact := r.LastLeaderContact
+		shardID := r.ShardID
+		r.mu.RUnlock()
+		nodeID := s.cfg.Node.ID
+		s.m.ReplicaVersion.WithLabelValues(shardID, nodeID).Set(float64(version))
+		s.m.ReplicaTerm.WithLabelValues(shardID, nodeID).Set(float64(term))
+		s.m.ReplicaIsLeader.WithLabelValues(shardID, nodeID).Set(isLeader)
+		if !lastContact.IsZero() {
+			s.m.LastLeaderContactSeconds.WithLabelValues(shardID, nodeID).Set(now.Sub(lastContact).Seconds())
+		}
+	}
 }
 
 // leaderAddrForReplica returns the HTTP address of the current leader for the given replica.
@@ -236,6 +284,8 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	// Phase 4: distributed election endpoints.
 	mux.HandleFunc("POST /internal/request_vote/{shard_id}", s.handleRequestVote)
 	mux.HandleFunc("POST /internal/leader_heartbeat/{shard_id}", s.handleLeaderHeartbeat)
+	// Reliability: Prometheus metrics.
+	mux.Handle("GET /metrics", s.m.Handler())
 }
 
 // Handler builds and returns the HTTP handler for this server.
@@ -327,6 +377,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 		s.mu.RLock()
 		leaderAddr = s.nodeAddresses[snap.LeaderID]
 		s.mu.RUnlock()
+		s.m.WritesTotal.WithLabelValues(shardID, "not_leader").Inc()
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusMisdirectedRequest)
 		_ = json.NewEncoder(w).Encode(KVResponse{
@@ -362,18 +413,22 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 
 	case "put":
 		if err := s.leaderWrite(r.Context(), replica, req); err != nil {
+			s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
 			return
 		}
+		s.m.WritesTotal.WithLabelValues(shardID, "ok").Inc()
 		_ = json.NewEncoder(w).Encode(KVResponse{OK: true})
 
 	case "delete":
 		if err := s.leaderWrite(r.Context(), replica, req); err != nil {
+			s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
 			return
 		}
+		s.m.WritesTotal.WithLabelValues(shardID, "ok").Inc()
 		_ = json.NewEncoder(w).Encode(KVResponse{OK: true})
 
 	default:
@@ -383,6 +438,10 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 
 // leaderWrite applies a write locally, fans out to followers, and checks quorum.
 func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVRequest) error {
+	start := s.clock.Now()
+	defer func() {
+		s.m.WriteDuration.WithLabelValues(replica.ShardID).Observe(s.clock.Now().Sub(start).Seconds())
+	}()
 	replica.writeMu.Lock()
 	defer replica.writeMu.Unlock()
 
@@ -461,8 +520,10 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	}
 	acks := fanOutReplicate(ctx, replica.ShardID, replReq, peerAddrs, s.cfg.QuorumTimeout)
 	if acks < needed {
+		replica.WriteErrTotal.Add(1)
 		return fmt.Errorf("quorum unavailable: got %d/%d follower ACKs", acks, needed)
 	}
+	replica.WriteOpsTotal.Add(1)
 	return nil
 }
 
@@ -494,6 +555,7 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	if req.Term < replica.Term {
 		term := replica.Term
 		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "stale_term").Inc()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Term: term, Error: "stale term"})
 		return
@@ -507,6 +569,7 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		walEntry := walEntryFrom(req.Op, req.Key, req.Value, req.Term, req.Version)
 		if err := ds.appendWAL(walEntry); err != nil {
 			replica.mu.Unlock()
+			s.m.ReplicationsTotal.WithLabelValues(shardID, "wal_error").Inc()
 			log.Printf("follower wal append failed shard_id=%s err=%v", shardID, err)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusInternalServerError)
@@ -520,6 +583,7 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	if req.Version <= replica.Version {
 		term := replica.Term
 		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "duplicate").Inc()
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: term})
 		return
@@ -558,6 +622,7 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	s.m.ReplicationsTotal.WithLabelValues(shardID, "ok").Inc()
 	log.Printf("replicated shard_id=%s op=%s key=%s version=%d", shardID, req.Op, req.Key, req.Version)
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: req.Term})

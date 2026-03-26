@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"time"
+
+	"github.com/davecarr1024/doki/internal/metrics"
 )
 
 // SyncResponse is returned by GET /internal/sync/{shard_id}.
@@ -23,8 +25,9 @@ type SyncResponse struct {
 //   - type="entries": the missing log entries to apply sequentially, or
 //   - type="snapshot": a full KV snapshot (fallback when the gap is too large).
 //
-// On success the replica is marked ready. On failure the caller may retry.
-func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAddr string) error {
+// Returns the recovery type ("incremental" or "snapshot") on success, or an error.
+// On success the replica is marked ready.
+func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAddr string) (string, error) {
 	replica.mu.RLock()
 	shardID := replica.ShardID
 	sinceVersion := replica.Version
@@ -34,19 +37,19 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		leaderAddr, shardID, sinceVersion)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("build recover request: %w", err)
+		return "", fmt.Errorf("build recover request: %w", err)
 	}
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("recover request: %w", err)
+		return "", fmt.Errorf("recover request: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("recover request status %d", resp.StatusCode)
+		return "", fmt.Errorf("recover request status %d", resp.StatusCode)
 	}
 	var recoverResp RecoverResponse
 	if err := json.NewDecoder(resp.Body).Decode(&recoverResp); err != nil {
-		return fmt.Errorf("decode recover response: %w", err)
+		return "", fmt.Errorf("decode recover response: %w", err)
 	}
 
 	replica.mu.Lock()
@@ -74,6 +77,7 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		replica.IsReady = true
 		log.Printf("incremental recovery complete shard_id=%s version=%d entries=%d",
 			shardID, replica.Version, len(recoverResp.Entries))
+		return "incremental", nil
 
 	case "snapshot":
 		replica.KV.ApplySnapshot(recoverResp.KV)
@@ -82,21 +86,22 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		replica.IsReady = true
 		log.Printf("snapshot fallback recovery complete shard_id=%s version=%d term=%d",
 			shardID, recoverResp.Version, recoverResp.Term)
+		return "snapshot", nil
 
 	default:
-		return fmt.Errorf("unknown recovery response type %q", recoverResp.Type)
+		return "", fmt.Errorf("unknown recovery response type %q", recoverResp.Type)
 	}
-	return nil
 }
 
 // runRecoveryLoop periodically attempts recovery for a not-ready follower replica.
 // It exits once the replica is marked ready or the context is cancelled.
 // getLeaderAddr is called each iteration so it always uses the current leader.
+// m is used to record recovery type metrics; pass nil to skip metric recording.
 //
 // Phase 3: recovery attempts incremental log-based catch-up first via
 // /internal/recover. The leader falls back to a full snapshot automatically
 // when the follower's gap exceeds the replication log size.
-func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr func() string) {
+func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr func() string, m *metrics.NodeMetrics) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -115,8 +120,14 @@ func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr f
 			if leaderAddr == "" {
 				continue
 			}
-			if err := doIncrementalRecovery(ctx, replica, leaderAddr); err != nil {
+			recoveryType, err := doIncrementalRecovery(ctx, replica, leaderAddr)
+			if err != nil {
 				log.Printf("recovery attempt failed shard_id=%s err=%v", shardID, err)
+			} else {
+				replica.RecoveryCount.Add(1)
+				if m != nil {
+					m.RecoveriesTotal.WithLabelValues(shardID, recoveryType).Inc()
+				}
 			}
 		}
 	}

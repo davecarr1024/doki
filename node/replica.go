@@ -2,6 +2,7 @@ package node
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/davecarr1024/doki/internal/replicationlog"
@@ -80,6 +81,12 @@ type ReplicaState struct {
 	// ElectionTimeout is the randomized timeout for this replica.
 	// A new election is triggered when (now - LastLeaderContact) > ElectionTimeout.
 	ElectionTimeout time.Duration
+
+	// Counters accessed atomically (no lock needed).
+	ElectionCount  atomic.Int64
+	RecoveryCount  atomic.Int64
+	WriteOpsTotal  atomic.Int64
+	WriteErrTotal  atomic.Int64
 }
 
 // NewReplicaState creates a new replica in FOLLOWER state, not ready.
@@ -104,26 +111,40 @@ func NewReplicaState(shardID, nodeID string, peers []string, logSize int, electi
 // Safe to call without holding the lock.
 func (r *ReplicaState) StatusSnapshot() ReplicaStatusSnapshot {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return ReplicaStatusSnapshot{
-		ShardID:  r.ShardID,
-		Role:     r.Role,
-		LeaderID: r.LeaderID,
-		Term:     r.Term,
-		Version:  r.Version,
-		IsReady:  r.IsReady,
-		Peers:    append([]string(nil), r.Peers...),
+	lastContact := r.LastLeaderContact
+	snap := ReplicaStatusSnapshot{
+		ShardID:       r.ShardID,
+		Role:          r.Role,
+		LeaderID:      r.LeaderID,
+		Term:          r.Term,
+		Version:       r.Version,
+		IsReady:       r.IsReady,
+		Peers:         append([]string(nil), r.Peers...),
+		ElectionCount: r.ElectionCount.Load(),
+		RecoveryCount: r.RecoveryCount.Load(),
+		WriteOpsTotal: r.WriteOpsTotal.Load(),
+		WriteErrTotal: r.WriteErrTotal.Load(),
 	}
+	r.mu.RUnlock()
+	if !lastContact.IsZero() {
+		snap.LastLeaderContactMs = time.Since(lastContact).Milliseconds()
+	}
+	return snap
 }
 
 // ReplicaStatusSnapshot is a point-in-time copy of a ReplicaState's observable fields.
 // Returned by StatusSnapshot() for use in HTTP responses.
 type ReplicaStatusSnapshot struct {
-	ShardID  string   `json:"shard_id"`
-	Role     Role     `json:"role"`
-	LeaderID string   `json:"leader_id"`
-	Term     uint64   `json:"term"`
-	Version  uint64   `json:"version"`
-	IsReady  bool     `json:"is_ready"`
-	Peers    []string `json:"peers"`
+	ShardID             string   `json:"shard_id"`
+	Role                Role     `json:"role"`
+	LeaderID            string   `json:"leader_id"`
+	Term                uint64   `json:"term"`
+	Version             uint64   `json:"version"`
+	IsReady             bool     `json:"is_ready"`
+	Peers               []string `json:"peers"`
+	LastLeaderContactMs int64    `json:"last_leader_contact_ms"`
+	ElectionCount       int64    `json:"election_count"`
+	RecoveryCount       int64    `json:"recovery_count"`
+	WriteOpsTotal       int64    `json:"write_ops_total"`
+	WriteErrTotal       int64    `json:"write_err_total"`
 }
