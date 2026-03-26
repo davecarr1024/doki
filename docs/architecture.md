@@ -44,20 +44,30 @@ doki/
 │   ├── coordinator/          # Entry point: coordinator binary
 │   └── node/                 # Entry point: node binary
 ├── coordinator/              # Coordinator library
-│   ├── membership.go         # Node registry, heartbeat tracking
+│   ├── membership.go         # Node registry, heartbeat tracking, dynamic join
 │   ├── leader.go             # Leader assignment logic
+│   ├── migration.go          # MigrationManager: live shard migration + split (Phase 5)
 │   └── server.go             # HTTP server + handlers
 ├── node/                     # Node library
 │   ├── replica.go            # Per-shard ReplicaState
+│   ├── election.go           # Distributed leader election (Phase 4)
+│   ├── recovery.go           # Incremental + bootstrap recovery (Phase 3 / 5)
+│   ├── replication.go        # Quorum replication fan-out
+│   ├── diskstate.go          # WAL + snapshot per shard (Phase 2)
 │   └── server.go             # HTTP server + handlers, heartbeat loop
 ├── internal/
 │   ├── clock/                # Clock interface (real + fake)
 │   ├── config/               # Config types and YAML loading
+│   ├── metrics/              # Prometheus metrics definitions
+│   ├── replicationlog/       # Bounded circular replication log (Phase 3)
 │   ├── shardmap/             # ShardMap types and operations
-│   └── storage/              # Storage interface + implementations
-│       └── memory/           # In-memory storage engine (v1)
+│   ├── snapshot/             # Atomic disk snapshot (Phase 2)
+│   ├── storage/              # Storage interface + implementations
+│   │   └── memory/           # In-memory storage engine
+│   └── wal/                  # Write-ahead log (Phase 2)
 ├── test/
-│   └── integration/          # End-to-end tests (real servers, no Docker)
+│   ├── integration/          # End-to-end tests (real servers, no Docker)
+│   └── reliability/          # Chaos, load, and monkey tests (build tag: reliability)
 ├── proto/                    # Protobuf definitions (gRPC, Phase 1+)
 │   ├── common.proto
 │   ├── coordinator.proto
@@ -93,11 +103,30 @@ sequenceDiagram
 
     loop every heartbeat_interval
         N->>C: POST /heartbeat {node_id, shards[]}
-        C-->>N: 200 OK
+        C-->>N: 200 OK {shard_map_version}
     end
 
     N->>C: GET /shardmap
-    C-->>N: ShardMap{version, shards[]}
+    C-->>N: ShardMap{version, shards[], node_addresses}
+```
+
+### Operator → Coordinator: Dynamic Cluster Management (Phase 5)
+
+```mermaid
+sequenceDiagram
+    participant OP as Operator
+    participant C as Coordinator
+
+    OP->>C: POST /admin/add_node {node_id, address}
+    C-->>OP: 200 OK
+
+    OP->>C: POST /admin/migrate_shard {shard_id, new_replicas}
+    C-->>OP: 200 {status: migrating}
+    note over C: background: shard_map version bumps,\nnew nodes recover, migration finalises
+
+    OP->>C: POST /admin/split_shard {source_shard_id, new_shard_id, new_replicas}
+    C-->>OP: 200 {status: splitting}
+    note over C: new shard bootstraps from source;\nbootstrap hint cleared when all replicas ready
 ```
 
 ---
@@ -165,15 +194,72 @@ sequenceDiagram
     R->>CO: GET /shardmap
     CO-->>R: ShardMap (leader = "node-a")
 
-    R->>L: SyncState(shard_id)
-    loop stream chunks
-        L-->>R: SnapshotChunk{term, version, entries[]}
+    R->>L: GET /internal/recover/{shard_id}?since_version=N
+    alt incremental (gap is small)
+        L-->>R: {type:"entries", entries:[...]}
+        note over R: apply log entries in order
+    else snapshot fallback (gap too large)
+        L-->>R: {type:"snapshot", kv:{...}, version:V}
+        note over R: apply snapshot atomically
     end
-    note over R: apply snapshot atomically
     R->>R: is_ready = true
-    loop apply buffered writes
-        L->>R: Replicate(version > snapshot.version)
+    note over R: replication fan-out resumes normally
+```
+
+---
+
+## Data Flow: Shard Migration (Phase 5)
+
+```mermaid
+sequenceDiagram
+    participant OP as Operator
+    participant CO as Coordinator
+    participant OLD as Old Replicas
+    participant NEW as New Replicas
+
+    OP->>CO: POST /admin/migrate_shard {shard_id, new_replicas}
+    CO->>CO: Replicas = old ∪ new\nIncomingReplicas = new
+    CO-->>OP: 200 {status: migrating}
+
+    note over NEW: refetchShardMap detects new shards
+    NEW->>CO: GET /shardmap
+    NEW->>OLD: GET /internal/recover/{shard_id}
+    OLD-->>NEW: snapshot / entries
+
+    loop health monitor tick
+        CO->>CO: allReady? check IncomingReplicas\nVersionForShard > 0 for each
     end
+
+    note over CO: all incoming replicas ready
+    CO->>CO: Replicas = new only\nIncomingReplicas = []\nReassign leader from new set
+    OLD->>OLD: dropShard (refetch removes old shard)
+```
+
+---
+
+## Data Flow: Shard Split (Phase 5)
+
+```mermaid
+sequenceDiagram
+    participant OP as Operator
+    participant CO as Coordinator
+    participant SRC as Source Shard Leader
+    participant NEW as New Shard Nodes
+
+    OP->>CO: POST /admin/split_shard {source, new_shard, new_replicas}
+    CO->>CO: Create new shard with BootstrapSourceShardID=source
+    CO-->>OP: 200 {status: splitting}
+
+    NEW->>CO: GET /shardmap
+    note over NEW: BootstrapSourceShardID set; is_ready=false
+    NEW->>SRC: GET /internal/recover/{source_shard_id}?since_version=0
+    SRC-->>NEW: snapshot of source shard
+
+    note over NEW: apply snapshot; clear BootstrapSourceShardID; is_ready=true
+    loop health monitor tick
+        CO->>CO: allReady? IncomingReplicas VersionForShard > 0
+    end
+    CO->>CO: ClearBootstrapSource; IncomingReplicas=[]\nAssign leader for new shard
 ```
 
 ---
@@ -184,7 +270,9 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> NOT_READY : node starts / restarts
 
-    NOT_READY --> READY : snapshot received and applied
+    NOT_READY --> NOT_READY : Bootstrap recovery in progress\n(BootstrapShardID set; fetching source shard)
+
+    NOT_READY --> READY : recovery complete\n(snapshot/entries applied; is_ready=true)
 
     READY --> READY : Replicate(version = v+1) received; apply + ACK
 
@@ -258,14 +346,22 @@ sequenceDiagram
 flowchart TD
     A[Load config] --> B[Fetch shard map from coordinator]
     B --> C[InitShards: create ReplicaState per shard]
-    C --> D{Phase 0?}
-    D -- yes --> E[Mark all shards is_ready=true]
-    D -- no --> F[Request snapshot from leader\nMark is_ready=false]
-    F --> G[Apply snapshot\nMark is_ready=true]
-    E --> H[Start HTTP server]
-    G --> H
-    H --> I[Start heartbeat goroutine]
-    I --> J[Serve traffic]
+    C --> D{BootstrapSourceShardID set?}
+    D -- yes --> E[Mark is_ready=false\nSet bootstrap leader addr]
+    D -- no --> F{Has prior WAL/snapshot?}
+    F -- yes --> G[Replay WAL\nMark is_ready=true]
+    F -- no --> H[Mark is_ready=false]
+    E --> I[Start HTTP server]
+    G --> I
+    H --> I
+    I --> J[Start heartbeat goroutine]
+    J --> K[Start per-shard recovery loops\nfor not-ready replicas]
+    K --> L[Serve traffic]
+    L --> M{shardmap changed?}
+    M -- new shard --> N[initShardLocked\nstartShardGoroutines]
+    M -- removed shard --> O[dropShard\ncancel context]
+    N --> L
+    O --> L
 ```
 
 ### Coordinator Startup
@@ -274,13 +370,15 @@ flowchart TD
 flowchart TD
     A[Load config] --> B[Build shard map from ShardSpec list]
     B --> C[Assign initial leaders from config]
-    C --> D[Start HTTP server]
-    D --> E[Start health monitor goroutine]
-    E --> F{node heartbeat received?}
-    F -- yes --> G[Record timestamp]
-    G --> F
-    F -- timeout --> H[Mark node dead\nReassign leader if needed]
-    H --> F
+    C --> D[Init MigrationManager]
+    D --> E[Start HTTP server]
+    E --> F[Start health monitor goroutine]
+    F --> G{node heartbeat received?}
+    G -- yes --> H[Record timestamp + shard versions]
+    H --> G
+    G -- timeout --> I[Mark node dead\nReassign leader if needed]
+    I --> J[CheckMigrations\nfinalise if all incoming ready]
+    J --> G
 ```
 
 ---
@@ -306,14 +404,19 @@ flowchart TD
 
 ```mermaid
 graph LR
-    GS[gRPC/HTTP Server goroutine] --> |dispatch| SH[Shard handlers]
+    GS[HTTP Server goroutine] --> |dispatch| SH[Shard handlers]
     SH --> |per-shard lock| RS[ReplicaState]
     HR[Heartbeat goroutine] --> CO[Coordinator]
     RP[Replication goroutines\none per follower] --> FN[Follower nodes]
+    RC[Recovery goroutine\nper not-ready shard] --> LN[Leader node]
+    EL[Election timer goroutine\nper shard] --> RS
     RS --> KV[Storage engine]
+    RS --> WL[WAL + Snapshot\nDiskState]
 ```
 
 Each shard's `ReplicaState` is protected by its own `sync.RWMutex`. No shard lock is ever held while acquiring another shard's lock.
+
+Each shard also has its own `context.CancelFunc` stored in the node's `cancelFuncs` map. When a shard is removed (e.g. after migration away), `dropShard` cancels the context, stopping all background goroutines for that shard cleanly.
 
 The coordinator uses a single `sync.RWMutex` for its state — acceptable in v1.
 

@@ -320,6 +320,18 @@ stateDiagram-v2
 
 ---
 
+## Recovery Reuse for Shard Migration (Phase 5)
+
+The same incremental recovery protocol (`GET /internal/recover/{shard_id}?since_version=N`) is reused for live shard migration and shard splitting:
+
+**Migration:** When a shard is migrated to new nodes, the new nodes start with `version=0` and call `GET /internal/recover/shard-id?since_version=0` against the current leader. This is exactly the same as a fresh follower joining the shard.
+
+**Split Bootstrap:** When a new shard is split from a source shard, the new shard's nodes have `BootstrapShardID=<source>`. Their recovery loop calls `GET /internal/recover/<source-shard-id>?since_version=0` against the **source shard's leader**, copying the source shard's current KV state as the new shard's initial state. Once recovery completes, the `BootstrapShardID` is cleared and the new shard evolves independently.
+
+This means the replication protocol is the only data transfer mechanism in the system — no separate bulk-load path is needed.
+
+---
+
 ## Configuration Reference
 
 | Parameter | Default | Description |

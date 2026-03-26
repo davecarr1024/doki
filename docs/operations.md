@@ -84,7 +84,7 @@ node:
   id: "node-a"
   address: "0.0.0.0:8000"
   coordinator_address: "coordinator:7000"
-  data_dir: "/data"   # unused in v1 (in-memory)
+  data_dir: "/data"   # WAL + snapshot directory (Phase 2+)
 ```
 
 ### Environment Variable Overrides
@@ -210,15 +210,93 @@ Set with `DOKI_LOG_LEVEL=DEBUG` for verbose output.
 | `term conflict` | WARN | Stale leader detected |
 | `replication lag high` | WARN | Follower lagging by >100 versions |
 
-### Metrics (Future)
+### Metrics (Prometheus)
 
-v1 does not expose Prometheus metrics. Future additions:
+All nodes expose Prometheus metrics at `GET /metrics`.
 
-- `doki_writes_total{shard, result}`
-- `doki_reads_total{shard, result}`
-- `doki_replication_lag_versions{shard, peer}`
-- `doki_leader_changes_total{shard}`
-- `doki_recovery_duration_seconds{shard}`
+Key metrics:
+
+| Metric | Labels | Description |
+|--------|--------|-------------|
+| `doki_writes_total` | `shard`, `result` | Total write operations (ok/error) |
+| `doki_reads_total` | `shard`, `result` | Total read operations |
+| `doki_replication_lag_versions` | `shard`, `peer` | Current replication lag per follower |
+| `doki_leader_changes_total` | `shard` | Number of leader changes |
+| `doki_recoveries_total` | `shard`, `type` | Recovery events (incremental/snapshot) |
+| `doki_elections_total` | `shard` | Election attempts triggered |
+| `doki_quorum_failures_total` | `shard` | Writes rejected due to quorum unavailable |
+
+Scrape all nodes in your Prometheus config:
+
+```yaml
+scrape_configs:
+  - job_name: doki
+    static_configs:
+      - targets: ['node-a:8001', 'node-b:8002', 'node-c:8003']
+```
+
+---
+
+## Admin API (Phase 5: Dynamic Cluster Management)
+
+The coordinator exposes admin endpoints for live cluster changes. These do not require a cluster restart.
+
+### Add a New Node
+
+Register a new node so it can receive heartbeats and be assigned shard replicas:
+
+```bash
+curl -s -X POST http://coordinator:7000/admin/add_node \
+  -H 'Content-Type: application/json' \
+  -d '{"node_id": "node-d", "address": "node-d:8004"}'
+# → 200 OK
+```
+
+After this call, start the new node binary. It will heartbeat in and appear in `/status`.
+
+### Migrate a Shard to New Nodes
+
+Move a shard's replica set to a different set of nodes without downtime:
+
+```bash
+curl -s -X POST http://coordinator:7000/admin/migrate_shard \
+  -H 'Content-Type: application/json' \
+  -d '{"shard_id": "shard-0", "new_replicas": ["node-d", "node-e", "node-f"]}'
+# → 200 {"status":"migrating"}
+```
+
+The coordinator:
+1. Sets `Replicas = old ∪ new` so both old and new nodes serve the shard simultaneously
+2. New nodes detect the shard in their next `/shardmap` refresh and start recovery
+3. Once all new nodes have recovered (`incoming_replicas` all have `version > 0`), the coordinator swaps `Replicas = new` and assigns a leader from the new set
+4. Old nodes detect they are no longer in the shard map and drop the shard
+
+Monitor progress:
+```bash
+watch -n 1 'curl -s http://coordinator:7000/shardmap | jq ".shards[] | select(.id==\"shard-0\") | {leader, replicas, incoming_replicas}"'
+```
+
+Migration is complete when `incoming_replicas` is empty and `leader` is one of the new nodes.
+
+### Split a Shard
+
+Create a new shard bootstrapped from an existing shard's data:
+
+```bash
+curl -s -X POST http://coordinator:7000/admin/split_shard \
+  -H 'Content-Type: application/json' \
+  -d '{"source_shard_id": "shard-0", "new_shard_id": "shard-1", "new_replicas": ["node-d", "node-e", "node-f"]}'
+# → 200 {"status":"splitting"}
+```
+
+The new shard nodes bootstrap their initial state from the source shard leader's current snapshot. Once all replicas of the new shard are ready, they operate independently from the source shard.
+
+Monitor progress:
+```bash
+watch -n 1 'curl -s http://coordinator:7000/shardmap | jq ".shards[] | select(.id==\"shard-1\")"'
+```
+
+Split is complete when `shard-1` appears in the shard map with a `leader` and `incoming_replicas` is empty.
 
 ---
 
@@ -364,6 +442,53 @@ done
 **Resolution:**
 - This should self-resolve within one heartbeat cycle
 - If it persists, check coordinator and look for network partition
+
+---
+
+### Migration Stuck (incoming_replicas Never Clears)
+
+**Cause:** One or more incoming replicas are not reaching `version > 0`. This happens when:
+- New nodes cannot reach the current leader for recovery
+- New nodes were not started or registered before migration was triggered
+- Network issues prevent recovery
+
+**Check:**
+```bash
+# Is the new node alive?
+curl http://coordinator:7000/status | jq '.nodes[] | select(.node_id=="node-d")'
+
+# Does the new node know about the shard?
+curl http://node-d:8004/status | jq '.shards'
+
+# Is recovery progressing?
+docker compose logs node-d | grep recovery
+```
+
+**Resolution:**
+- Ensure the new node is registered via `/admin/add_node` before triggering migration
+- Ensure the new node process is running and can reach the coordinator and the current leader
+- Check that the node's `data_dir` is writable
+
+---
+
+### Shard Split Bootstrap Fails
+
+**Cause:** New shard nodes cannot recover from the source shard leader. This can happen if:
+- The bootstrap leader address was not captured at split time (coordinator restarted between split and recovery)
+- The source shard leader changed after the split was initiated
+
+**Check:**
+```bash
+# Does the new shard appear in the shard map at all?
+curl http://coordinator:7000/shardmap | jq '.shards[] | select(.id=="shard-1")'
+
+# Is the new node attempting bootstrap recovery?
+curl http://node-d:8004/status | jq '.shards[] | select(.shard_id=="shard-1")'
+```
+
+**Resolution:**
+- Ensure source shard nodes are running and healthy before initiating a split
+- If the bootstrap is permanently stuck, trigger a fresh split with the same target shard ID and new nodes
 
 ---
 

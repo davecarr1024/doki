@@ -9,11 +9,11 @@ This document describes the testing approach for Doki: philosophy, layers, invar
 Testing is a first-class concern. Doki is a distributed system; the kinds of bugs it produces — data loss, stale reads, split-brain — are subtle and may not appear under normal conditions. Tests must be able to:
 
 - Start and stop real cluster nodes
-- Inject failures (node crashes, slow followers, network partitions)
+- Inject failures (node crashes, slow followers)
 - Assert against distributed invariants (not just individual node state)
 - Be deterministic and reproducible
 
-**Rule:** Never rely on wall-clock timing in tests. Use injected clocks and configurable timeouts.
+**Rule:** Never rely on wall-clock timing in tests. Use injected clocks and configurable timeouts where possible; use `require.Eventually` with generous budgets in integration tests.
 
 ---
 
@@ -24,54 +24,55 @@ Testing is a first-class concern. Doki is a distributed system; the kinds of bug
 Test individual components in isolation:
 
 - Storage engine: correct Get/Put/Delete behavior
-- Replication logic: version tracking, quorum counting
-- Routing logic: shard map parsing, key-to-shard mapping
+- Replication log: append, replay, bounds checking
+- Shard map: parsing, version tracking, mutation methods
 - Config parsing: valid and invalid inputs
+- Coordinator logic: leader assignment, membership tracking
+- Node handlers: routing, term checks, quorum counting
 
-Unit tests are fast, deterministic, and do not use network or real timers.
+Unit tests are fast, deterministic, and do not use real network or timers.
 
-```
-test/unit/
-  storage_test.go
-  replicator_test.go
-  routing_test.go
-  config_test.go
-```
-
-### 2. Component Tests
-
-Test a single component with real gRPC but mocked dependencies:
-
-- Node behavior with a mock coordinator
-- Coordinator behavior with mock nodes
-- Recovery behavior with a mock leader
-
-Component tests use a loopback network. No Docker required.
-
-```
-test/component/
-  node_test.go
-  coordinator_test.go
-  recovery_test.go
+```bash
+make test            # runs all unit tests
+go test ./...
 ```
 
-### 3. Integration Tests
+### 2. Integration Tests
 
-Test a full cluster end-to-end:
+Test a full cluster end-to-end using **real in-process HTTP servers** on random ports (`:0`). No Docker required.
 
-- Real nodes, real coordinator
-- Docker containers via Testcontainers
-- Real gRPC over localhost network
-- Real failure injection
+```bash
+make test-int
+go test -tags integration ./test/integration/...
+```
 
-Integration tests are slower but are the primary correctness validation.
+Each test:
+- Starts real coordinator and node servers as goroutines
+- Uses `t.Cleanup()` to shut down servers when the test ends
+- Uses `require.Eventually` for convergence assertions
+- Runs on random ports to avoid port conflicts
 
 ```
 test/integration/
-  cluster/         # Test cluster builder
-  scenarios/       # Test scenarios
-  assertions/      # Invariant checkers
+  helpers_test.go      # startCluster, waitForHTTP, postKV helpers
+  basic_test.go        # read/write/delete scenarios
+  failover_test.go     # leader failover, quorum scenarios
+  recovery_test.go     # snapshot and incremental recovery
+  election_test.go     # distributed leader election (Phase 4)
+  sharding_test.go     # dynamic add_node, migrate_shard, split_shard (Phase 5)
 ```
+
+### 3. Reliability Tests (Chaos / Load / Monkey)
+
+Long-running tests that exercise the system under stress:
+
+```bash
+make test-reliability  # chaos + load + monkey
+make test-chaos        # fault injection only
+make test-load         # throughput benchmarks
+```
+
+These use the `//go:build reliability` build tag and live in `test/reliability/`. They are not run as part of the normal CI pipeline.
 
 ---
 
@@ -79,62 +80,48 @@ test/integration/
 
 ### Test Cluster Builder
 
-The test cluster builder provides a fluent API for creating clusters:
+`startCluster` in `helpers_test.go` builds a full cluster:
 
 ```go
-cluster := testcluster.New().
-    WithCoordinator().
-    WithNodes(3).
-    WithShard("shard-0", replicas: ["node-0", "node-1", "node-2"]).
-    Build(t)
-defer cluster.Shutdown()
-
-cluster.WaitUntilReady(timeout: 10s)
+cluster := startCluster(t, []string{"node-a", "node-b", "node-c"}, []config.ShardSpec{
+    {ID: "shard-0", Replicas: []string{"node-a", "node-b", "node-c"}, InitialLeader: "node-a"},
+})
+// cluster.CoordinatorAddr  — coordinator HTTP address
+// cluster.NodeAddrs        — map[nodeID]address
 ```
 
-Each node is a Docker container. The cluster builder handles:
+All servers use `t.Cleanup()` to shut down. Random ports prevent interference between parallel tests.
 
-- Container lifecycle (start, stop, kill)
-- Network management
-- Log collection
-- Health waiting
+### Key Helpers
+
+```go
+// postKV sends a KV operation to a node
+kvr, status := postKV(t, nodeAddr, shardID, node.KVRequest{Op: "put", Key: "k", Value: "v"})
+
+// leaderAddrFor returns the current leader's HTTP address for a shard
+addr := leaderAddrFor(t, coordAddr, "shard-0")
+
+// waitForHTTP polls until a URL responds 200
+waitForHTTP(t, "http://"+addr+"/status", 5*time.Second)
+
+// getJSONDecoded fetches a URL and JSON-decodes the response
+ok := getJSONDecoded(t, "http://"+addr+"/status", &result)
+
+// fetchShardMapRespHTTP fetches and returns the coordinator's shard map
+sm := fetchShardMapRespHTTP(t, "http://"+coordAddr+"/shardmap")
+```
 
 ### Failure Injection
 
-The test framework supports:
+Integration tests simulate failures by cancelling server contexts:
 
 ```go
-// Kill a node (SIGKILL, immediate)
-cluster.KillNode("node-1")
+// Kill a node: cancel its context (stops all goroutines including HTTP server)
+cancel()
 
-// Stop a node gracefully (SIGTERM)
-cluster.StopNode("node-1")
-
-// Restart a stopped node
-cluster.RestartNode("node-1")
-
-// Partition a node from the rest of the cluster
-cluster.PartitionNode("node-1")
-
-// Heal a partition
-cluster.HealPartition("node-1")
-
-// Slow down a node's network responses
-cluster.SlowNode("node-1", latency: 500ms)
-```
-
-Network partitions and latency injection are implemented using [Toxiproxy](https://github.com/Shopify/toxiproxy), a configurable TCP proxy. Each node's traffic passes through a Toxiproxy instance that tests can control.
-
-### Invariant Checkers
-
-After any scenario, tests run invariant checks:
-
-```go
-assertions.AssertSingleLeaderPerShard(cluster)
-assertions.AssertCommittedWritesSurviveFailover(cluster, writes)
-assertions.AssertNoStalereads(cluster)
-assertions.AssertFollowersConverge(cluster, shard_id, timeout)
-assertions.AssertRecoveredStateMatchesLeader(cluster, node_id, shard_id)
+// Restart-equivalent: start a fresh server on the same or new address
+newSrv := node.NewServer(cfg, clock.Real{})
+go newSrv.Start(ctx)
 ```
 
 ---
@@ -145,7 +132,7 @@ assertions.AssertRecoveredStateMatchesLeader(cluster, node_id, shard_id)
 
 | Test | Description |
 |------|-------------|
-| `TestBasicWrite` | Write a key and read it back |
+| `TestBasicPutGet` | Write a key and read it back |
 | `TestOverwrite` | Write a key twice, confirm latest value |
 | `TestDelete` | Write a key, delete it, confirm not found |
 | `TestNonExistentKey` | Read a key that was never written |
@@ -155,17 +142,16 @@ assertions.AssertRecoveredStateMatchesLeader(cluster, node_id, shard_id)
 
 | Test | Description |
 |------|-------------|
-| `TestWriteReplicatedToFollowers` | After a write, verify all followers have the value |
-| `TestFollowerDoesNotServeReads` | Confirm follower returns NOT_LEADER |
-| `TestFollowerRedirectsToLeader` | Confirm follower returns correct leader hint |
-| `TestVersionMonotonicity` | Confirm version never decreases |
+| `TestWriteReplicatedToFollowers` | After a write, verify all followers converge |
+| `TestFollowerDoesNotServeReads` | Follower returns NOT_LEADER |
+| `TestVersionMonotonicity` | Version never decreases |
 
 ### Quorum
 
 | Test | Description |
 |------|-------------|
-| `TestWriteSucceedsWithOneFollowerDown` | 3-node shard, kill 1 follower, writes still succeed |
-| `TestWriteFailsWithTwoFollowersDown` | 3-node shard, kill 2 followers, writes return QUORUM_UNAVAILABLE |
+| `TestWriteSucceedsWithOneFollowerDown` | 3-node shard, kill 1 follower, writes succeed |
+| `TestWriteFailsWithTwoFollowersDown` | 3-node shard, kill 2 followers, QUORUM_UNAVAILABLE |
 | `TestReadSucceedsWithFollowersDown` | Leader-only reads succeed even if followers are dead |
 
 ### Failover
@@ -173,76 +159,73 @@ assertions.AssertRecoveredStateMatchesLeader(cluster, node_id, shard_id)
 | Test | Description |
 |------|-------------|
 | `TestLeaderFailover` | Kill leader, confirm new leader elected, writes resume |
-| `TestLeaderFailoverPreservesCommitted` | Kill leader after N writes, confirm all committed writes survive |
+| `TestLeaderFailoverPreservesCommitted` | Kill leader after N writes, confirm all survive |
 | `TestDoubleFailover` | Kill leader twice in succession |
-| `TestFollowerFailover` | Kill a follower and rejoin, confirm state syncs |
+| `TestFollowerFailover` | Kill a follower, rejoin, confirm state syncs |
 
 ### Recovery
 
 | Test | Description |
 |------|-------------|
-| `TestFollowerRecovery` | Kill a follower, write 100 keys, restart follower, verify sync |
-| `TestSlowRecovery` | Simulate a slow follower reconnection under continuous writes |
-| `TestRecoveryStateMatches` | Recovered follower's state exactly matches leader state |
-| `TestRecoveryAfterLag` | Follower falls far behind, triggers snapshot-based recovery |
+| `TestFollowerRecovery` | Kill a follower, write keys, restart follower, verify sync |
+| `TestIncrementalRecovery` | Follower catches up via log entries (not full snapshot) |
+| `TestSnapshotFallback` | Follower falls far behind; snapshot recovery kicks in |
+| `TestRecoveryStateMatchesLeader` | Recovered state exactly matches leader at same version |
 
-### Routing
-
-| Test | Description |
-|------|-------------|
-| `TestClientRoutingUpdate` | Client caches stale leader; verify it retries correctly |
-| `TestClientAfterLeaderChange` | Client continues after failover without restart |
-
-### Coordinator
+### Leader Election (Phase 4)
 
 | Test | Description |
 |------|-------------|
-| `TestCoordinatorFailure` | Coordinator goes down; cluster continues serving reads/writes |
-| `TestCoordinatorRestart` | Coordinator restarts; leadership is reestablished |
+| `TestSelfElection` | Node detects missed heartbeats and triggers election |
+| `TestElectionWithHigherVersionWins` | Candidate with latest data wins election |
+| `TestNoDoubleVote` | Node does not vote twice in same term |
+| `TestLeaderHeartbeatPreventsElection` | Active leader resets election timer via replication |
+
+### Dynamic Sharding (Phase 5)
+
+| Test | Description |
+|------|-------------|
+| `TestDynamic_AddNode` | New node registered, appears alive in coordinator status |
+| `TestDynamic_MigrateShard` | Pre-migration writes survive; new nodes serve data after migration |
+| `TestDynamic_SplitShard` | New shard bootstraps from source; both shards independently writable |
+| `TestDynamic_ClientsContinueDuringMigration` | Old leader serves writes during migration window |
 
 ---
 
 ## Key Invariants
 
-These properties are checked after every scenario:
+These properties are checked in integration tests after every significant scenario:
 
 ### I1: Single Leader Per Shard
 
-At any point in time, at most one node believes it is the leader for a given shard at a given term.
+At most one node has `role=LEADER` for a given `(shard_id, term)` at any point.
 
 ```go
-// Query all nodes; confirm at most one LEADER per (shard_id, term)
+// AssertNoSplitBrain queries /status on all nodes and confirms at most
+// one LEADER per (shard_id, term).
+assertNoSplitBrain(t, cluster)
 ```
-
-This is checked by querying `/status` on all nodes and verifying uniqueness.
 
 ### I2: Committed Writes Survive Failover
 
-A write that received `OK` from the leader must be readable after any failover to a new leader.
+A write that received `OK` from the leader must be readable from the new leader after failover.
 
 ```go
-writes := []Write{{key: "x", value: "1"}, ...}
-for _, w := range writes {
-    assert.OK(cluster.Put(w.key, w.value))
-}
-cluster.KillNode(leader)
-cluster.WaitForNewLeader(shard)
-for _, w := range writes {
-    assert.Equal(w.value, cluster.Get(w.key))
-}
+// Write N keys → kill leader → wait for new leader → read all N keys
+assertAllCommittedWritesSurvive(t, cluster, writes)
 ```
 
 ### I3: No Writes Without Quorum
 
-A write must not return `OK` unless quorum was reached. Tested by killing majority of replicas and verifying writes fail.
+A write must not return `OK` unless quorum was reached.
 
 ### I4: Followers Converge
 
-After all writes complete and all nodes are healthy, every follower must have the same state as the leader for the same shard.
+After all writes complete and all nodes are healthy, every follower must have the same KV state as the leader for the same shard.
 
 ### I5: Recovery Yields Identical State
 
-A node that recovers via snapshot must have an identical kv map to the leader at the snapshot version.
+A node that recovers via snapshot (or incremental catch-up) must have the exact same KV contents as the leader at the recovered version.
 
 ---
 
@@ -250,37 +233,45 @@ A node that recovers via snapshot must have an identical kv map to the leader at
 
 ### Injected Clocks
 
-Production code should accept a `Clock` interface:
+The `Clock` interface (`internal/clock`) is injected throughout the codebase:
 
 ```go
 type Clock interface {
     Now() time.Time
-    Sleep(d time.Duration)
     After(d time.Duration) <-chan time.Time
 }
 ```
 
-Tests provide a `FakeClock` that can be advanced manually, eliminating timing-dependent behavior in unit and component tests.
+Unit tests use `FakeClock`, which can be advanced manually:
+
+```go
+clk := clock.NewFake(time.Now())
+clk.Advance(2 * time.Second)
+```
+
+Integration tests use `clock.Real{}` with real timers.
 
 ### Configurable Timeouts
 
-All timeouts must be configurable via environment variable or config, not hardcoded. Integration tests use shorter timeouts (100ms heartbeat, 300ms failure timeout) to speed up failure detection.
-
-### Retry Budgets
-
-Tests that wait for convergence should use polling with a maximum retry budget rather than fixed sleeps:
+All timeouts are configurable via `NodeConfig` / `CoordinatorConfig`. Integration tests use aggressive timeouts:
 
 ```go
-func WaitForCondition(t *testing.T, condition func() bool, timeout time.Duration, msg string) {
-    deadline := time.Now().Add(timeout)
-    for time.Now().Before(deadline) {
-        if condition() {
-            return
-        }
-        time.Sleep(50 * time.Millisecond)
-    }
-    t.Fatalf("condition not met: %s", msg)
+nodeCfg := &config.NodeConfig{
+    HeartbeatIntervalMs: 100,
+    HeartbeatInterval:   100 * time.Millisecond,
 }
+```
+
+This speeds up failure detection from 1.5s to ~300ms.
+
+### Convergence Polling
+
+Integration tests use `require.Eventually` rather than fixed sleeps:
+
+```go
+require.Eventually(t, func() bool {
+    return isLeaderReady(coordAddr, "shard-0")
+}, 5*time.Second, 100*time.Millisecond, "shard-0 leader not ready")
 ```
 
 ---
@@ -288,33 +279,39 @@ func WaitForCondition(t *testing.T, condition func() bool, timeout time.Duration
 ## Running Tests
 
 ```bash
-# Unit tests (fast, no Docker)
+# Unit tests only (fast, no network)
+make test
 go test ./...
 
-# Component tests
-go test ./test/component/...
+# Integration tests (starts real HTTP servers)
+make test-int
+go test -tags integration ./test/integration/... -v
 
-# Integration tests (requires Docker)
-go test ./test/integration/...
+# Single integration test
+go test -tags integration ./test/integration/ -run TestDynamic_MigrateShard -v
 
-# Specific scenario
-go test ./test/integration/scenarios/ -run TestLeaderFailover -v
+# Reliability suite (chaos + load, long-running)
+make test-reliability
 
-# All tests with verbose output
-go test ./... -v -count=1
+# Chaos tests only
+make test-chaos
+
+# Load tests only
+make test-load
 ```
 
 ---
 
 ## Test Coverage Goals
 
-| Layer | Target Coverage | Notes |
-|-------|----------------|-------|
-| Storage engine | 95%+ | Pure logic, easy to cover |
-| Replication logic | 90%+ | Core protocol |
+| Layer | Target | Notes |
+|-------|--------|-------|
+| Storage engine | 95%+ | Pure logic |
+| Replication log | 90%+ | Core protocol component |
 | Recovery logic | 85%+ | Critical correctness path |
-| Coordinator logic | 85%+ | Leader assignment, health monitor |
-| Integration scenarios | All key scenarios | Failover, quorum, recovery |
+| Coordinator logic | 85%+ | Leader assignment, membership |
+| Integration scenarios | All key scenarios | Failover, quorum, recovery, dynamic sharding |
+| Reliability | Chaos + load | Non-deterministic; run separately |
 
 Coverage is a guide, not a target. A badly-written test that hits a line is worse than no test.
 
@@ -324,8 +321,11 @@ Coverage is a guide, not a target. A badly-written test that hits a line is wors
 
 Integration test failures are diagnosed via:
 
-1. **Container logs** — each test captures logs from all containers, written to `test/logs/<test-name>/`
-2. **Status snapshots** — tests periodically call `/status` on all nodes and save responses
-3. **Timeline events** — a test event log records writes, kills, and assertions with timestamps
+1. **Test logs** — use `-v` flag; each server logs to the test logger via `t.Logf`
+2. **Status snapshots** — tests call `/status` on coordinator and nodes during assertions
+3. **`require.Eventually` messages** — failure messages include a description of what was expected
 
-If a test is flaky, the first step is to add more `WaitForCondition` checks rather than increasing sleep durations.
+If a test is flaky:
+- Check for missing `require.Eventually` (replace `time.Sleep` + immediate assertion)
+- Check for goroutine leaks (use `t.Cleanup` to cancel contexts, not `defer` in loops)
+- Check if a shard still shows `is_ready=false` when traffic is being sent to it

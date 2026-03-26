@@ -188,32 +188,47 @@ node/election.go                            all Phase 4 election logic
 
 ---
 
-## Phase 5: Dynamic Sharding
+## Phase 5: Dynamic Sharding ✅ Complete
 
 **Theme:** Cluster can grow and shards can move.
 
 **New Concepts:**
-- Shard migration
-- Dynamic cluster membership
-- Split/merge shards
-- Consistent hash ring (optional)
+- Dynamic cluster membership: nodes join at runtime without restart
+- Shard migration: live replica-set handoff with dual-serving window
+- Shard split: new shard bootstrapped from an existing shard's snapshot
+- Per-shard goroutine lifecycle: shards start and stop cleanly at runtime
 
-**What Gets Built:**
-- Coordinator API to add/remove nodes
-- Shard migration: leader-to-leader snapshot transfer with routing update
-- Atomic shard map update: old and new shard location served during migration window
-- Shard split: coordinator triggers split, new shard bootstraps from snapshot
-- (Optional) Consistent hashing for key routing
+**What Was Built:**
+- `coordinator/migration.go`: `MigrationManager` — tracks in-progress migrations; finalises when all incoming replicas catch up (monitored via `VersionForShard` in heartbeat data); also clears bootstrap hints for splits
+- `POST /admin/add_node` — registers a new node in membership so it can heartbeat and receive shards
+- `POST /admin/migrate_shard` — expands replica set to old ∪ new, records target; background monitor completes swap once all new replicas are ready
+- `POST /admin/split_shard` — creates a new shard with `BootstrapSourceShardID`; new nodes fetch initial snapshot from the source shard's leader
+- `LeaderManager.InitTerm` — initialises term counter for dynamically-created shards
+- `buildShardMapResponse` now sources node addresses from `Membership` (not static config) so new nodes are visible to the cluster
+- `ShardInfo.BootstrapSourceShardID` — source-shard hint cleared after all replicas are ready
+- `ShardInfo.IncomingReplicas` — migration target tag, visible in `/shardmap` so clients can observe progress
+- `ShardMap.SetReplicas`, `SetIncomingReplicas`, `ClearBootstrapSource`, `RemoveShard` — new operations
+- Node: `initShardLocked` extracted from `InitShards`; called live when the shard map delivers new assignments
+- Node: `startShardGoroutines` / `dropShard` — per-shard `context.CancelFunc` prevents goroutine leaks on drop
+- Node: `refetchShardMap` now detects added and removed shards; also updates peer list mid-migration
+- `ReplicaState.BootstrapShardID/BootstrapLeaderAddr` — recovery loop fetches from source shard's leader while bootstrapping; cleared after first successful recovery
+- Bootstrap leaders are not marked `IsReady` until recovery completes (prevents serving stale-empty reads)
 
-**Key Invariants to Test:**
-- No writes lost during shard migration
-- Clients automatically route to new location after migration
-- No double-write window during split
+**Key Invariants:**
+- One leader per shard at all times — old leader continues serving during the migration window
+- Committed writes survive migration — new replicas catch up via the incremental recovery log
+- No double-write window during split — source shard continues independently; new shard accepts writes only after bootstrap completes
 
-**Definition of Done:**
-- A new node can join and receive a migrated shard
-- Existing clients continue to work during migration
-- Integration test: add node, migrate shard, verify all data accessible
+**Completed:** 4 integration tests (add node, migrate shard, split shard, clients continue during migration) all pass. All 9 pre-existing integration test suites continue to pass.
+
+```
+POST /admin/add_node             register new node in cluster membership
+POST /admin/migrate_shard        begin live shard migration to new replica set
+POST /admin/split_shard          create new shard bootstrapped from existing one
+coordinator/migration.go         MigrationManager — background migration monitor
+internal/shardmap/shardmap.go    SetReplicas, SetIncomingReplicas, ClearBootstrapSource, RemoveShard
+node/server.go                   initShardLocked, startShardGoroutines, dropShard, live refetchShardMap
+```
 
 ---
 

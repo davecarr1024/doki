@@ -68,11 +68,12 @@ Doki is not a production system. It is optimized for:
 
 The coordinator is the **control plane**. It is a single process (no HA in v1) responsible for:
 
-- Maintaining the cluster membership list (statically configured)
+- Maintaining the cluster membership list (statically configured at startup; dynamic join supported via `POST /admin/add_node`)
 - Defining the shard map: which nodes host which shards
 - Assigning leaders to shards
 - Serving routing metadata to clients and nodes
 - Detecting node failures via heartbeat
+- Managing live shard migration and shard splitting (Phase 5)
 
 The coordinator does not store user data. It stores only metadata.
 
@@ -203,27 +204,48 @@ The version is a 64-bit unsigned integer. It starts at 0 and never resets (unles
 
 ## 5. Sharding
 
-### v1: Static Explicit Shards
+### Static + Dynamic Shards (Phase 5)
 
-Shards are defined in the coordinator's configuration file at startup. There is no dynamic re-sharding in v1.
+Shards can be defined statically in the coordinator's configuration file at startup **and** created/migrated dynamically at runtime without restarting the cluster.
 
 Each shard has:
 - A shard ID (e.g., `shard-0`, `shard-1`)
 - A set of replica nodes
 - An assigned leader (may change via coordinator)
+- (During migration) an `incoming_replicas` list of nodes still catching up
+- (During split) a `bootstrap_source_shard_id` pointing to the source shard to copy data from
 
-Example configuration:
+Example static configuration:
 
 ```yaml
 shards:
   - id: shard-0
     replicas: [node-a, node-b, node-c]
-    leader: node-a
+    initial_leader: node-a
 
   - id: shard-1
     replicas: [node-b, node-c, node-d]
-    leader: node-b
+    initial_leader: node-b
 ```
+
+### Dynamic Operations
+
+**Add Node** — Register a new node so it can receive heartbeats and be assigned shard replicas:
+```
+POST /admin/add_node {node_id, address}
+```
+
+**Migrate Shard** — Move a shard's replica set to new nodes without downtime:
+```
+POST /admin/migrate_shard {shard_id, new_replicas}
+```
+The coordinator sets `Replicas = old ∪ new` (dual-serving window) and `IncomingReplicas = new`. New nodes recover from the current leader. Once all incoming replicas have `VersionForShard > 0`, the coordinator finalises: sets `Replicas = new` and assigns a leader from the new set. Old nodes detect the change via `refetchShardMap` and drop the shard.
+
+**Split Shard** — Create a new shard bootstrapped from an existing shard:
+```
+POST /admin/split_shard {source_shard_id, new_shard_id, new_replicas}
+```
+The new shard is created with `BootstrapSourceShardID = source_shard_id`. New nodes recover the source shard's full snapshot rather than their own (empty) shard. Once recovery is complete, the bootstrap hint is cleared and the new shard operates independently.
 
 ### Shard Map
 
@@ -231,34 +253,31 @@ The **shard map** is the coordinator's view of the current shard layout. It is v
 
 ```
 ShardMap {
-  version:  uint64
-  shards:   map<ShardId, ShardInfo>
+  version:        uint64
+  shards:         map<ShardId, ShardInfo>
+  node_addresses: map<NodeId, string>
 }
 
 ShardInfo {
-  shard_id:  ShardId
-  replicas:  []NodeId
-  leader:    NodeId
+  shard_id:                ShardId
+  replicas:                []NodeId
+  leader:                  NodeId
+  incoming_replicas:       []NodeId   // non-empty during migration
+  bootstrap_source_shard_id: ShardId  // non-empty during shard split
 }
 ```
 
 ### Key Routing
 
-In v1, key-to-shard routing is explicit: the coordinator config specifies which shard owns which key range or key set.
+Key-to-shard routing is explicit: the caller specifies the shard ID directly in each request. There is no automatic hash-based routing in v1.
 
-> **Decision for v1:** Rather than hash-based routing, keys are routed to shards by explicit configuration or by a simple modulo hash over the key. This avoids implementing a consistent hash ring in v1 while still making the routing mechanism pluggable.
-
-A simple routing rule:
-
-```
-shard_index = hash(key) % num_shards
-```
-
-This is a deliberate simplification. In future versions this will be replaced with range-based or consistent-hash routing.
+> **Decision for v1:** Explicit shard targeting keeps routing simple. Clients and operators are responsible for choosing the right shard. Hash-based routing can be added as a thin client-side layer.
 
 ### Shard Map Caching
 
 Clients and nodes cache the shard map. When a request is routed incorrectly (e.g., to a stale leader), the receiving node returns a `NOT_LEADER` response with the current leader hint. The client updates its cache and retries.
+
+Nodes poll the coordinator for shard map updates every heartbeat interval (`refetchShardMap`) and react to changes: starting goroutines for new shards and dropping shards they are no longer assigned to.
 
 ---
 
@@ -268,15 +287,23 @@ Each replica maintains the following state:
 
 ```
 ReplicaState {
-  shard_id:   ShardId          // which shard this replica serves
-  node_id:    NodeId           // identity of this node
-  role:       Role             // LEADER or FOLLOWER
-  leader_id:  NodeId           // current known leader for this shard
-  term:       uint64           // leader epoch; incremented on each new leader
-  version:    uint64           // monotonic commit counter; incremented per write
-  kv:         map<key, value>  // the actual data
-  is_ready:   bool             // false during recovery
-  peers:      []NodeId         // other replica nodes for this shard
+  shard_id:              ShardId          // which shard this replica serves
+  node_id:               NodeId           // identity of this node
+  role:                  Role             // LEADER or FOLLOWER
+  leader_id:             NodeId           // current known leader for this shard
+  term:                  uint64           // leader epoch; incremented on each new leader
+  version:               uint64           // monotonic commit counter; incremented per write
+  kv:                    map<key, value>  // the actual data
+  rep_log:               Log              // bounded replication log (Phase 3)
+  is_ready:              bool             // false during recovery
+  peers:                 []NodeId         // other replica nodes for this shard
+  // Phase 4: election state
+  last_leader_contact:   timestamp        // last valid leader message; drives election timer
+  voted_for:             NodeId           // candidate voted for in current term
+  election_timeout:      duration         // randomized election timeout
+  // Phase 5: bootstrap for shard splits
+  bootstrap_shard_id:    ShardId          // if set, recover from this shard instead
+  bootstrap_leader_addr: string           // address of source shard's leader for bootstrap
 }
 ```
 
@@ -423,11 +450,12 @@ If `response.term > request.term`, the leader knows it is stale and steps down.
 
 A replica enters recovery when:
 
-- It restarts after a crash
-- It is added to a shard for the first time
-- It detects its version is far behind the leader
+- It restarts after a crash (Phase 2: replays WAL first; if gap remains, falls back to remote recovery)
+- It is added to a shard for the first time (including via migration)
+- It detects its version is far behind the leader (gap > replication log size)
+- It is a new shard bootstrapping from a source shard (Phase 5 split)
 
-### Recovery Protocol
+### Recovery Protocol (Phase 3: Incremental)
 
 ```mermaid
 sequenceDiagram
@@ -435,25 +463,28 @@ sequenceDiagram
     participant CO as Coordinator
     participant L as Leader
 
-    R->>CO: WhereIsLeader(shard_id)
-    CO-->>R: leader_id = "node-a"
+    R->>CO: GET /shardmap
+    CO-->>R: ShardMap (leader = "node-a")
 
-    R->>L: SyncRequest(shard_id)
-    loop stream chunks
-        L-->>R: SnapshotChunk{term, version, entries[]}
+    R->>L: GET /internal/recover/{shard_id}?since_version=N
+    alt incremental (gap fits in replication log)
+        L-->>R: {type:"entries", entries:[{version, op, key, value},...]}
+        note over R: apply each entry; version = entry.version; is_ready = true
+    else snapshot fallback
+        L-->>R: {type:"snapshot", kv:{...}, version:V, term:T}
+        note over R: replace kv; version = V; term = T; is_ready = true
     end
-    L-->>R: SnapshotChunk{is_last=true}
-
-    note over R: 1. replace kv store with snapshot<br/>2. version = snapshot.version<br/>3. term = snapshot.term<br/>4. is_ready = true
-
-    note over R: apply buffered writes (version > snapshot.version)
 ```
+
+### Bootstrap Recovery (Phase 5: Shard Split)
+
+When `BootstrapShardID` is set on a replica, the recovery loop fetches from the **source shard** on the **bootstrap leader address** rather than the normal shard leader. This ensures new shard nodes receive the source shard's data as their initial state. `sinceVersion` is always 0 for bootstrap recovery.
+
+Once recovery succeeds, `BootstrapShardID` and `BootstrapLeaderAddr` are cleared and the replica operates normally.
 
 ### Consistency of Snapshot
 
-The leader creates the snapshot atomically with respect to incoming writes. While the snapshot is being sent, new writes may be committed. The leader tracks the version at snapshot time; the recovering node applies any replication messages with `version > snapshot.version` after applying the snapshot.
-
-> **Implementation note:** The simplest approach is to pause writes on the shard briefly while creating the snapshot. This is acceptable in v1 given no performance requirements. A more sophisticated approach uses copy-on-write semantics.
+The leader holds its shard lock while building the snapshot map, ensuring the snapshot is a consistent point-in-time copy. New writes arriving after the snapshot is taken are replicated normally; the recovering node receives them and applies only entries with `version > snapshot.version`.
 
 ### Trust Model
 
@@ -495,11 +526,22 @@ A node that is no longer the leader may still believe it is (e.g., due to a part
 1. **Term check:** Every replication message carries the sender's term. If a receiver has a higher term, it rejects the message and notifies the sender.
 2. **Coordinator query:** A follower that receives a write from a node that is not the coordinator-assigned leader rejects it.
 
-### Limitations in v1
+### Phase 4: Distributed Leader Election
 
-- No quorum-based election — the coordinator is a single point of failure for leadership decisions
-- No split-brain guarantee under network partitions — if the coordinator is partitioned from the cluster, no new leader can be elected, but the old leader may continue serving (reads succeed; writes may fail if followers are unreachable)
-- This is acceptable for v1 given the learning focus
+In Phase 4, nodes run a Raft-like election timer. If a follower does not receive a valid leader message within its randomized `election_timeout`, it starts a self-election:
+
+1. Increments its term and votes for itself
+2. Sends `RequestVote(term, shard_id, last_version)` to peers
+3. If a majority respond with `granted=true`, the node becomes leader and notifies the coordinator
+4. The coordinator updates the shard map and term
+
+This means the cluster can elect a new leader without coordinator involvement, reducing the coordinator's role to a metadata store.
+
+### Limitations
+
+- The coordinator is still a single point of failure for shard map updates and new membership
+- No split-brain guarantee under network partitions — the term check is the primary safeguard
+- Coordinator HA is a future phase
 
 ---
 
@@ -532,42 +574,58 @@ When a follower receives a write or read request:
 
 | Function | Description |
 |----------|-------------|
-| Cluster registry | Maintains the authoritative list of nodes |
-| Shard map | Defines shard→replica mappings |
+| Cluster registry | Maintains the authoritative list of nodes (static config + dynamic `add_node`) |
+| Shard map | Defines shard→replica mappings, including migration and split state |
 | Leader assignment | Assigns and reassigns shard leaders |
-| Health monitoring | Tracks heartbeats; detects failures |
-| Routing service | Answers `WhereIsLeader(shard_id)` queries |
+| Health monitoring | Tracks heartbeats; detects failures; checks migration progress |
+| Routing service | Answers shard map queries from nodes and clients |
+| Migration management | Orchestrates live shard migration and shard splitting |
 
 ### State
 
 ```
 CoordinatorState {
-  nodes:     map<NodeId, NodeInfo>
-  shard_map: ShardMap
-  config:    ClusterConfig
+  nodes:      map<NodeId, NodeInfo>
+  shard_map:  ShardMap
+  config:     ClusterConfig
+  migrations: map<ShardId, MigrationRecord>
 }
 
 NodeInfo {
-  node_id:       NodeId
-  address:       string
-  last_heartbeat: timestamp
-  is_alive:      bool
+  node_id:          NodeId
+  address:          string
+  last_heartbeat:   timestamp
+  is_alive:         bool
+  shard_versions:   map<ShardId, uint64>  // from heartbeat payload
+}
+
+MigrationRecord {
+  shard_id:     ShardId
+  old_replicas: []NodeId
+  new_replicas: []NodeId
 }
 ```
 
-### APIs
+### HTTP APIs
 
 ```
 // Called by nodes
-Heartbeat(node_id) → HeartbeatResponse
+POST /heartbeat {node_id, shards:[{shard_id, version}]} → {shard_map_version}
 
 // Called by clients and nodes
-GetShardMap() → ShardMap
-WhereIsLeader(shard_id) → NodeId
+GET  /shardmap → ShardMap
 
-// Internal (coordinator-initiated)
-AssignLeader(shard_id, leader_id, term) → void
-SetFollower(shard_id, leader_id, term) → void
+// Called by nodes (leader election, Phase 4)
+POST /coordinator/notify_leader {shard_id, node_id, term}
+
+// Admin (operator / tests)
+POST /admin/add_node       {node_id, address}
+POST /admin/migrate_shard  {shard_id, new_replicas}
+POST /admin/split_shard    {source_shard_id, new_shard_id, new_replicas}
+
+// Coordinator → Node (shard map push via HTTP)
+POST /assign_leader  {shard_id, term}
+POST /set_follower   {shard_id, leader_id, term}
 ```
 
 ### Coordinator Failure in v1
@@ -619,44 +677,47 @@ If a follower is behind by more than `max_lag_versions` (default: 1000), the lea
 
 ## 15. Storage Engine
 
-### v1: In-Memory
+### In-Memory KV (Phase 1)
 
-```cpp
-std::map<std::string, std::string> kv;
+The primary storage engine is an in-memory map:
+```
+map[string]string
 ```
 
-Simple, ordered, no persistence. On process restart, all data is lost. Recovery is always via snapshot from leader.
+Simple, ordered, no disk persistence on its own. All data access goes through the `Storage` interface.
 
 Operations:
-- `Get(key)` → O(log n)
-- `Put(key, value)` → O(log n)
-- `Delete(key)` → O(log n)
+- `Get(key)` → O(1) average (Go map)
+- `Put(key, value)` → O(1) average
+- `Delete(key)` → O(1) average
 - `Snapshot()` → O(n) full copy
 
-### v2: Write-Ahead Log (Planned)
+### Write-Ahead Log + Disk Snapshots (Phase 2)
 
-When durability is added:
+Each shard has a `DiskState` wrapping:
+1. A **WAL** — append-only log of `{op, key, value}` entries written before being applied to the in-memory KV
+2. A **snapshot** — a periodic atomic dump of the full KV state to disk
 
-1. Writes are appended to a WAL before being applied to the in-memory state
-2. On restart, the WAL is replayed to reconstruct state
-3. Snapshots are written to disk periodically; the WAL is truncated
+On restart, recovery proceeds:
+1. Load the latest snapshot from disk into KV
+2. Replay any WAL entries written after the snapshot
+3. If the resulting version is still behind the leader, fall back to remote recovery
 
 ### Storage Interface
 
-The storage layer should be abstracted behind an interface to allow swapping:
+All application code accesses storage through the `Storage` interface:
 
-```cpp
-class Storage {
- public:
-  virtual Status Get(const Key& key, Value* value) = 0;
-  virtual Status Put(const Key& key, const Value& value) = 0;
-  virtual Status Delete(const Key& key) = 0;
-  virtual Snapshot TakeSnapshot() = 0;
-  virtual Status ApplySnapshot(const Snapshot& snap) = 0;
-};
+```go
+type Storage interface {
+    Get(key string) (string, bool)
+    Put(key, value string)
+    Delete(key string)
+    Snapshot() map[string]string
+    ApplySnapshot(kv map[string]string)
+}
 ```
 
-This interface is established in v1 even though only the in-memory implementation exists.
+Only the in-memory implementation (`internal/storage/memory`) exists. The WAL and snapshot are a separate durability layer (`node/diskstate.go`) that wraps the in-memory store rather than replacing it.
 
 ---
 
@@ -805,78 +866,78 @@ node:
 
 ## 19. Open Questions
 
-These are the known open questions. Each has a recommended answer for v1 to avoid design paralysis, with notes on when to revisit.
+Questions resolved by prior phases are marked ✅. Remaining open questions are for Phase 6+.
 
 ### Replication
 
 **Q: Should followers stage (buffer) writes before applying, or apply immediately?**
 
-> **v1 answer:** Apply immediately. This is simpler. The downside (uncommitted state on follower) is accepted in v1. Revisit when implementing a proper replication log in v2.
+> ✅ **Resolved (Phase 1):** Apply immediately. The downside (potential uncommitted state on a follower if the leader fails before quorum) is mitigated by the replication log (Phase 3) and WAL (Phase 2). A proper two-phase commit is future work.
 
 **Q: How to handle version conflicts if a stale follower receives a write with a skipped version?**
 
-> **v1 answer:** If a follower receives a write with `version > local_version + 1`, it triggers recovery (full snapshot). This is heavy-handed but correct.
+> ✅ **Resolved (Phase 3):** If `version > local_version + 1`, the follower marks itself not-ready and triggers the recovery loop, which attempts incremental catch-up first, falling back to a full snapshot if the gap is too large.
 
 **Q: Should replication be pipelined (multiple in-flight writes)?**
 
-> **v1 answer:** No. One write at a time on the leader. Simple. Revisit in v3 for throughput.
+> **Open (Phase 6+):** No pipelining yet. One write at a time on the leader.
 
 ### Leader Election
 
 **Q: When to move off coordinator-driven election?**
 
-> **v1 answer:** Not in v1 or v2. Coordinator-driven is fine until we want to handle coordinator failure with HA. Target v4 for Raft-like election.
+> ✅ **Resolved (Phase 4):** Nodes run a Raft-like election timer and can elect a leader without coordinator involvement.
 
 **Q: How to guarantee safety under partitions?**
 
-> **v1 answer:** We don't, fully, in v1. The coordinator can create a split-brain window. Document this as a known limitation. Add fencing tokens (via term) to reduce the impact. Full solution is v4.
+> **Open (Phase 6+):** Term-based fencing reduces the split-brain window but does not fully eliminate it. Full safety requires a majority quorum for all shard-map writes.
 
 ### Recovery
 
 **Q: When to introduce incremental catch-up?**
 
-> **v1 answer:** Not in v1. Full snapshot is correct and simple. Incremental catch-up targets v3.
+> ✅ **Resolved (Phase 3):** The leader maintains a bounded circular replication log. Recovering replicas request entries since their current version; only gaps that exceed the log size fall back to a full snapshot.
 
 **Q: Snapshot vs log for recovery?**
 
-> **v1 answer:** Snapshot only. Log-based recovery requires a log (v2). After v2, combine: snapshot + tail of log.
+> ✅ **Resolved (Phase 2/3):** Snapshot + WAL tail on disk for local restart. Remote recovery uses incremental log entries where possible and falls back to a full KV snapshot.
 
 ### Sharding
 
 **Q: Hash vs range partitioning?**
 
-> **v1 answer:** Simple modulo hash. No range queries in v1, so range partitioning offers no benefit. Revisit in v5 or when SQL layer needs range scans.
+> **Open (Phase 6):** Explicit shard targeting is used for now. Automatic hash routing can be a thin client-side layer.
 
 **Q: When to support shard split/merge?**
 
-> **v1 answer:** Not before v5. Requires dynamic cluster membership and significant coordinator complexity.
+> ✅ **Resolved (Phase 5):** Live shard migration and shard splitting are implemented. Shard merging is not yet supported.
 
 ### Durability
 
 **Q: When to require fsync?**
 
-> **v1 answer:** Not in v1. In-memory only is acceptable. WAL + fsync targets v2. Until then, data does not survive process restart.
+> ✅ **Resolved (Phase 2):** WAL entries are written before application; snapshots are written atomically. fsync is called on WAL writes to ensure crash durability.
 
 **Q: What are the restart guarantees?**
 
-> **v1 answer:** None. A restarted node always recovers from the leader. This is explicit and documented.
+> ✅ **Resolved (Phase 2):** A restarted node replays its WAL and latest snapshot. Only writes that were never written to WAL (i.e., in-flight at crash time) may be lost; those writes never returned OK to the client.
 
 ### SQL
 
 **Q: When to introduce indexes?**
 
-> **v1 answer:** Not before v6. Primary-key-only access is sufficient for initial SQL layer.
+> **Open (Phase 6):** Primary-key-only access is sufficient for initial SQL layer.
 
 **Q: How to handle multi-shard queries?**
 
-> **v1 answer:** Not supported in v1 SQL. All queries must target a single shard (single primary key). Cross-shard joins and transactions are future work.
+> **Open (Phase 6+):** Not supported. All queries target a single shard. Cross-shard joins and transactions are future work.
 
 ### Testing
 
 **Q: How to simulate network partitions in integration tests?**
 
-> **v1 answer:** Use Docker network manipulation (`docker network disconnect`) or a test proxy layer that can drop/delay packets. The test proxy (toxiproxy or a simple custom proxy) is preferred for determinism.
+> **Resolved approach:** Integration tests use in-process servers on random ports. Partitions are simulated by killing a node's context or stopping its goroutines. Full network-level partition simulation (toxiproxy) is used in reliability/chaos tests.
 
 **Q: How deterministic should integration tests be?**
 
-> **v1 answer:** Tests should be deterministic where possible. Use injected clocks and configurable timeouts. Avoid relying on wall-clock timing. The test harness should be able to advance time artificially to trigger timeouts.
+> **Resolved approach:** Unit tests use `FakeClock` for full determinism. Integration tests use real clocks with `require.Eventually` and generous timeouts. Chaos/reliability tests deliberately introduce non-determinism to surface race conditions.
