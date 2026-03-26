@@ -28,8 +28,14 @@ type loadBaseline struct {
 	SuccessRatePct  float64   `json:"success_rate_pct"`
 }
 
-// recordBaseline appends a result to the baselines file.
-func recordBaseline(t *testing.T, result loadBaseline) {
+// regressionThreshold is the fraction by which a metric can degrade before a
+// warning is emitted. 0.20 = 20% regression triggers a log warning (soft gate).
+const regressionThreshold = 0.20
+
+// recordAndCompareBaseline appends result to the baselines file and emits a
+// warning (soft gate — does NOT fail the test) if throughput or p99 regressed
+// more than regressionThreshold vs. the previous run of the same test.
+func recordAndCompareBaseline(t *testing.T, result loadBaseline) {
 	t.Helper()
 	path := filepath.Clean(baselineFile)
 	if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
@@ -42,8 +48,37 @@ func recordBaseline(t *testing.T, result loadBaseline) {
 	if data, err := os.ReadFile(path); err == nil {
 		_ = json.Unmarshal(data, &baselines)
 	}
-	baselines = append(baselines, result)
 
+	// Find the most recent prior run of the same test.
+	var prior *loadBaseline
+	for i := len(baselines) - 1; i >= 0; i-- {
+		if baselines[i].TestName == result.TestName {
+			cp := baselines[i]
+			prior = &cp
+			break
+		}
+	}
+
+	if prior != nil {
+		// Soft gate: warn on throughput drop.
+		if prior.Throughput > 0 {
+			drop := (prior.Throughput - result.Throughput) / prior.Throughput
+			if drop > regressionThreshold {
+				t.Logf("REGRESSION WARNING: %s throughput dropped %.1f%% (%.1f → %.1f wps)",
+					result.TestName, drop*100, prior.Throughput, result.Throughput)
+			}
+		}
+		// Soft gate: warn on p99 increase.
+		if prior.P99Ms > 0 {
+			increase := (result.P99Ms - prior.P99Ms) / prior.P99Ms
+			if increase > regressionThreshold {
+				t.Logf("REGRESSION WARNING: %s p99 latency increased %.1f%% (%.1fms → %.1fms)",
+					result.TestName, increase*100, prior.P99Ms, result.P99Ms)
+			}
+		}
+	}
+
+	baselines = append(baselines, result)
 	data, err := json.MarshalIndent(baselines, "", "  ")
 	if err != nil {
 		t.Logf("could not marshal baseline: %v", err)
@@ -52,6 +87,11 @@ func recordBaseline(t *testing.T, result loadBaseline) {
 	if err := os.WriteFile(path, data, 0o640); err != nil {
 		t.Logf("could not write baseline: %v", err)
 	}
+}
+
+// recordBaseline is an alias kept for backwards compatibility.
+func recordBaseline(t *testing.T, result loadBaseline) {
+	recordAndCompareBaseline(t, result)
 }
 
 // --- Test: Baseline throughput ---
