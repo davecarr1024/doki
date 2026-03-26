@@ -27,6 +27,11 @@ import (
 // Phase 4 additions:
 //   - POST /notify_leader  — distributed election notification
 //
+// Phase 5 additions:
+//   - POST /admin/add_node       — register a new node in the cluster
+//   - POST /admin/migrate_shard  — begin migrating a shard to a new replica set
+//   - POST /admin/split_shard    — create a new shard bootstrapped from an existing one
+//
 // Reliability additions:
 //   - GET /metrics         — Prometheus metrics
 type Server struct {
@@ -34,6 +39,7 @@ type Server struct {
 	membership *Membership
 	shards     *shardmap.ShardMap
 	leader     *LeaderManager
+	migration  *MigrationManager
 	clock      clock.Clock
 	m          *metrics.CoordinatorMetrics
 	httpServer *http.Server
@@ -45,11 +51,13 @@ func NewServer(cfg *config.ClusterConfig, clk clock.Clock) *Server {
 	membership := NewMembership(cfg.Nodes, cfg.Coordinator.FailureTimeout, clk)
 	shards := shardmap.New()
 	leader := NewLeaderManager(shards, membership)
+	migration := NewMigrationManager(shards, membership, leader)
 	return &Server{
 		cfg:        cfg,
 		membership: membership,
 		shards:     shards,
 		leader:     leader,
+		migration:  migration,
 		clock:      clk,
 		m:          metrics.NewCoordinatorMetrics(),
 	}
@@ -113,6 +121,10 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /leader/{shard_id}", s.handleLeaderQuery)
 	// Phase 4: distributed election notification.
 	mux.HandleFunc("POST /notify_leader", s.handleNotifyLeader)
+	// Phase 5: dynamic cluster management.
+	mux.HandleFunc("POST /admin/add_node", s.handleAdminAddNode)
+	mux.HandleFunc("POST /admin/migrate_shard", s.handleAdminMigrateShard)
+	mux.HandleFunc("POST /admin/split_shard", s.handleAdminSplitShard)
 	// Reliability: Prometheus metrics.
 	mux.Handle("GET /metrics", s.m.Handler())
 }
@@ -154,9 +166,12 @@ func (s *Server) handleShardMap(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) buildShardMapResponse() ShardMapResponse {
 	version, shards := s.shards.Snapshot()
-	nodeAddrs := make(map[string]string, len(s.cfg.Nodes))
-	for _, n := range s.cfg.Nodes {
-		nodeAddrs[n.ID] = n.Address
+	// Use membership as the authoritative source of node addresses so that
+	// dynamically-added nodes (Phase 5) are included.
+	allNodes := s.membership.All()
+	nodeAddrs := make(map[string]string, len(allNodes))
+	for _, ns := range allNodes {
+		nodeAddrs[ns.ID] = ns.Address
 	}
 	return ShardMapResponse{
 		Version:       version,
@@ -349,6 +364,8 @@ func (s *Server) runHealthMonitor(ctx context.Context) {
 					s.m.LeaderReassignmentsTotal.WithLabelValues(shardID).Inc()
 				}
 			}
+			// Phase 5: advance any in-progress shard migrations / splits.
+			s.migration.CheckMigrations()
 			s.refreshMetrics()
 		}
 	}
@@ -390,4 +407,97 @@ func (s *Server) refreshMetrics() {
 		}
 		s.m.NodeAlive.WithLabelValues(ns.ID).Set(v)
 	}
+}
+
+// --- Phase 5: admin handlers ---
+
+// AddNodeRequest is the body of POST /admin/add_node.
+type AddNodeRequest struct {
+	NodeID  string `json:"node_id"`
+	Address string `json:"address"`
+}
+
+// handleAdminAddNode registers a new node so it can heartbeat and receive shards.
+func (s *Server) handleAdminAddNode(w http.ResponseWriter, r *http.Request) {
+	var req AddNodeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.NodeID == "" || req.Address == "" {
+		http.Error(w, "node_id and address required", http.StatusBadRequest)
+		return
+	}
+	s.membership.AddNode(config.NodeSpec{ID: req.NodeID, Address: req.Address})
+	log.Printf("node registered node_id=%s address=%s", req.NodeID, req.Address)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// MigrateShardRequest is the body of POST /admin/migrate_shard.
+type MigrateShardRequest struct {
+	ShardID     string   `json:"shard_id"`
+	NewReplicas []string `json:"new_replicas"`
+}
+
+// handleAdminMigrateShard begins a shard migration to a new replica set.
+// The migration is finalised automatically once all new replicas catch up.
+func (s *Server) handleAdminMigrateShard(w http.ResponseWriter, r *http.Request) {
+	var req MigrateShardRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.ShardID == "" || len(req.NewReplicas) == 0 {
+		http.Error(w, "shard_id and new_replicas required", http.StatusBadRequest)
+		return
+	}
+	if err := s.migration.StartMigration(req.ShardID, req.NewReplicas); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "migrating"})
+}
+
+// SplitShardRequest is the body of POST /admin/split_shard.
+type SplitShardRequest struct {
+	SourceShardID string   `json:"source_shard_id"`
+	NewShardID    string   `json:"new_shard_id"`
+	NewReplicas   []string `json:"new_replicas"`
+}
+
+// handleAdminSplitShard creates a new shard bootstrapped from an existing one.
+// The new shard's replicas fetch their initial snapshot from the source shard's
+// leader. The source shard continues to serve normally throughout.
+func (s *Server) handleAdminSplitShard(w http.ResponseWriter, r *http.Request) {
+	var req SplitShardRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+	if req.SourceShardID == "" || req.NewShardID == "" || len(req.NewReplicas) == 0 {
+		http.Error(w, "source_shard_id, new_shard_id, and new_replicas required", http.StatusBadRequest)
+		return
+	}
+	// Verify source shard exists.
+	if _, err := s.shards.Get(req.SourceShardID); err != nil {
+		http.Error(w, "source shard not found", http.StatusBadRequest)
+		return
+	}
+	info := shardmap.ShardInfo{
+		ID:                     req.NewShardID,
+		Replicas:               req.NewReplicas,
+		BootstrapSourceShardID: req.SourceShardID,
+	}
+	if err := s.shards.AddShard(info); err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	// Initialise term for the new shard.
+	s.leader.InitTerm(req.NewShardID)
+	log.Printf("shard split initiated source=%s new=%s replicas=%v",
+		req.SourceShardID, req.NewShardID, req.NewReplicas)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]string{"status": "splitting"})
 }

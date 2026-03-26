@@ -82,6 +82,14 @@ type ReplicaState struct {
 	// A new election is triggered when (now - LastLeaderContact) > ElectionTimeout.
 	ElectionTimeout time.Duration
 
+	// Phase 5: bootstrap state for shard splits.
+	// When BootstrapShardID is non-empty, the recovery loop fetches data from
+	// BootstrapShardID (a different shard) rather than this replica's own shard.
+	// BootstrapLeaderAddr overrides the leader address for the initial recovery.
+	// Both fields are cleared once the first recovery completes successfully.
+	BootstrapShardID    string
+	BootstrapLeaderAddr string
+
 	// Counters accessed atomically (no lock needed).
 	ElectionCount  atomic.Int64
 	RecoveryCount  atomic.Int64

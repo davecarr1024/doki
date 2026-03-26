@@ -12,9 +12,21 @@ import (
 
 // ShardInfo is the runtime state of a single shard.
 type ShardInfo struct {
-	ID       string   // shard identifier, e.g. "shard-0"
-	Replicas []string // node IDs that host this shard
-	Leader   string   // current leader node ID; empty if no leader assigned
+	ID       string   `json:"id"`       // shard identifier, e.g. "shard-0"
+	Replicas []string `json:"replicas"` // node IDs that host this shard
+	Leader   string   `json:"leader"`   // current leader node ID; empty if no leader assigned
+
+	// BootstrapSourceShardID is set during a shard split. When non-empty, nodes
+	// that are initialising this shard should fetch their initial snapshot from
+	// the named shard's leader instead of this shard's (not-yet-elected) leader.
+	// Cleared by the coordinator once all replicas report ready.
+	BootstrapSourceShardID string `json:"bootstrap_source_shard_id,omitempty"`
+
+	// IncomingReplicas tracks the target replica set during a shard migration.
+	// While this slice is non-empty the coordinator considers the shard to be
+	// mid-migration.  Once every incoming replica is ready the coordinator
+	// sets Replicas = IncomingReplicas and clears this field.
+	IncomingReplicas []string `json:"incoming_replicas,omitempty"`
 }
 
 // Quorum returns the number of replicas required to form a majority.
@@ -112,6 +124,78 @@ func (m *ShardMap) SetLeader(shardID, nodeID string) error {
 		return fmt.Errorf("node %q is not a replica of shard %q", nodeID, shardID)
 	}
 	s.Leader = nodeID
+	m.version++
+	return nil
+}
+
+// SetReplicas atomically replaces the replica set for a shard.
+// Returns an error if the shard does not exist.
+// The leader is cleared if it is no longer in the new replica set.
+func (m *ShardMap) SetReplicas(shardID string, replicas []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.shards[shardID]
+	if !ok {
+		return fmt.Errorf("shard %q not found", shardID)
+	}
+	s.Replicas = append([]string(nil), replicas...)
+	// Clear leader if it's no longer in the new replica set.
+	if s.Leader != "" {
+		found := false
+		for _, r := range s.Replicas {
+			if r == s.Leader {
+				found = true
+				break
+			}
+		}
+		if !found {
+			s.Leader = ""
+		}
+	}
+	m.version++
+	return nil
+}
+
+// SetIncomingReplicas marks a shard as mid-migration with the given target replica set.
+// The full replica set (old ∪ new) should already be set via SetReplicas before calling this.
+func (m *ShardMap) SetIncomingReplicas(shardID string, incoming []string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.shards[shardID]
+	if !ok {
+		return fmt.Errorf("shard %q not found", shardID)
+	}
+	s.IncomingReplicas = append([]string(nil), incoming...)
+	m.version++
+	return nil
+}
+
+// ClearBootstrapSource removes the BootstrapSourceShardID from a shard after
+// all replicas have finished bootstrapping.
+func (m *ShardMap) ClearBootstrapSource(shardID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	s, ok := m.shards[shardID]
+	if !ok {
+		return fmt.Errorf("shard %q not found", shardID)
+	}
+	if s.BootstrapSourceShardID == "" {
+		return nil // nothing to do
+	}
+	s.BootstrapSourceShardID = ""
+	m.version++
+	return nil
+}
+
+// RemoveShard removes a shard from the map.
+// Returns an error if the shard does not exist.
+func (m *ShardMap) RemoveShard(shardID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.shards[shardID]; !ok {
+		return fmt.Errorf("shard %q not found", shardID)
+	}
+	delete(m.shards, shardID)
 	m.version++
 	return nil
 }

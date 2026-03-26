@@ -51,6 +51,17 @@ func (lm *LeaderManager) InitFromConfig(cfg *config.ClusterConfig) error {
 	return nil
 }
 
+// InitTerm initialises the term counter for a shard to 1.
+// Used when a shard is created dynamically (Phase 5).
+// No-op if the shard already has a term.
+func (lm *LeaderManager) InitTerm(shardID string) {
+	lm.mu.Lock()
+	defer lm.mu.Unlock()
+	if _, ok := lm.terms[shardID]; !ok {
+		lm.terms[shardID] = 1
+	}
+}
+
 // TermForShard returns the current term for a shard.
 func (lm *LeaderManager) TermForShard(shardID string) uint64 {
 	lm.mu.RLock()

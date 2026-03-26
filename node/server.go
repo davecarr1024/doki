@@ -17,6 +17,7 @@ import (
 	"github.com/davecarr1024/doki/internal/config"
 	"github.com/davecarr1024/doki/internal/metrics"
 	"github.com/davecarr1024/doki/internal/replicationlog"
+	"github.com/davecarr1024/doki/internal/shardmap"
 	"github.com/davecarr1024/doki/internal/wal"
 )
 
@@ -46,6 +47,11 @@ import (
 //   - POST /internal/leader_heartbeat/{shard_id} — leader liveness heartbeat
 //   - Distributed leader election with randomized timeouts
 //   - POST /notify_leader on coordinator — elected leader notifies coordinator
+//
+// Phase 5 additions:
+//   - Dynamic shard initialisation: new shards detected via shard map updates
+//   - Dynamic shard removal: shards removed from this node's assignments are dropped
+//   - Shard splits: bootstrap recovery from a source shard's leader
 type Server struct {
 	cfg             *config.NodeConfig
 	clock           clock.Clock
@@ -53,10 +59,16 @@ type Server struct {
 	replicas        map[string]*ReplicaState // shard_id → replica
 	diskStates      map[string]*diskState    // shard_id → disk state (WAL + snapshot)
 	nodeAddresses   map[string]string        // nodeID → HTTP address (from coordinator)
+	// shardLeaders tracks the current leader for each shard (updated from shard map).
+	// Used to resolve bootstrap leader addresses for split shards.
+	shardLeaders    map[string]string        // shard_id → leader node_id
 	shardMapVersion uint64
 	mu              sync.RWMutex
 	startedAt       time.Time
 	httpServer      *http.Server
+	// Phase 5: per-shard contexts allow individual shards to be stopped cleanly.
+	serverCtx   context.Context
+	cancelFuncs map[string]context.CancelFunc // shard_id → cancel
 }
 
 // NewServer creates a node Server from the given config.
@@ -72,6 +84,8 @@ func NewServer(cfg *config.NodeConfig, clk clock.Clock) *Server {
 		replicas:      make(map[string]*ReplicaState),
 		diskStates:    make(map[string]*diskState),
 		nodeAddresses: make(map[string]string),
+		shardLeaders:  make(map[string]string),
+		cancelFuncs:   make(map[string]context.CancelFunc),
 		startedAt:     clk.Now(),
 	}
 }
@@ -107,43 +121,128 @@ func (s *Server) InitShards(resp coordinator.ShardMapResponse) {
 		if !shard.HasReplica(s.cfg.Node.ID) {
 			continue
 		}
-		peers := make([]string, 0, len(shard.Replicas)-1)
-		for _, r := range shard.Replicas {
-			if r != s.cfg.Node.ID {
-				peers = append(peers, r)
-			}
-		}
-		r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers, s.cfg.ReplicationLogSize, s.electionTimeout())
-		if shard.Leader == s.cfg.Node.ID {
-			r.Role = RoleLeader
-			r.IsReady = true // leader starts ready; disk state applied below if available
-		}
-		r.LeaderID = shard.Leader
-
-		// Try to load from disk if a data directory is configured.
-		if s.cfg.DataDir != "" {
-			shardDir := shardDataDir(s.cfg.DataDir, shard.ID)
-			ds, err := openDiskState(shardDir, s.cfg.SnapshotInterval)
-			if err != nil {
-				log.Printf("disk state open failed shard_id=%s err=%v — continuing without disk state", shard.ID, err)
-			} else {
-				s.diskStates[shard.ID] = ds
-				loaded, err := ds.load()
-				if err != nil {
-					log.Printf("disk state load failed shard_id=%s err=%v", shard.ID, err)
-				} else if loaded.Valid {
-					r.KV.ApplySnapshot(loaded.KV)
-					r.Version = loaded.Version
-					r.Term = loaded.Term
-					r.IsReady = true // disk state means we don't need network recovery
-					log.Printf("disk state restored shard_id=%s version=%d term=%d", shard.ID, loaded.Version, loaded.Term)
-				}
-			}
-		}
-
-		s.replicas[shard.ID] = r
-		log.Printf("shard initialized shard_id=%s role=%s leader=%s is_ready=%v", shard.ID, r.Role, r.LeaderID, r.IsReady)
+		s.initShardLocked(shard, resp)
 	}
+}
+
+// initShardLocked initialises a single shard replica.
+// Must be called with s.mu held for writing.
+// resp is the full shard map response (used to resolve bootstrap source leader).
+func (s *Server) initShardLocked(shard shardmap.ShardInfo, resp coordinator.ShardMapResponse) {
+	if _, exists := s.replicas[shard.ID]; exists {
+		return // already initialised
+	}
+
+	peers := make([]string, 0, len(shard.Replicas)-1)
+	for _, r := range shard.Replicas {
+		if r != s.cfg.Node.ID {
+			peers = append(peers, r)
+		}
+	}
+	r := NewReplicaState(shard.ID, s.cfg.Node.ID, peers, s.cfg.ReplicationLogSize, s.electionTimeout())
+	if shard.Leader == s.cfg.Node.ID {
+		r.Role = RoleLeader
+		// Phase 5: don't mark ready yet for bootstrap shards — recovery loop
+		// must apply the source shard's data first.
+		if shard.BootstrapSourceShardID == "" {
+			r.IsReady = true
+		}
+	}
+	r.LeaderID = shard.Leader
+
+	// Phase 5: for shard splits, record where to fetch the initial snapshot.
+	if shard.BootstrapSourceShardID != "" {
+		r.BootstrapShardID = shard.BootstrapSourceShardID
+		// Find the source shard's leader address.
+		for _, sh := range resp.Shards {
+			if sh.ID == shard.BootstrapSourceShardID && sh.Leader != "" {
+				r.BootstrapLeaderAddr = resp.NodeAddresses[sh.Leader]
+				break
+			}
+		}
+		log.Printf("shard split bootstrap shard_id=%s source=%s bootstrap_addr=%s",
+			shard.ID, shard.BootstrapSourceShardID, r.BootstrapLeaderAddr)
+	}
+
+	// Try to load from disk if a data directory is configured.
+	if s.cfg.DataDir != "" {
+		shardDir := shardDataDir(s.cfg.DataDir, shard.ID)
+		ds, err := openDiskState(shardDir, s.cfg.SnapshotInterval)
+		if err != nil {
+			log.Printf("disk state open failed shard_id=%s err=%v — continuing without disk state", shard.ID, err)
+		} else {
+			s.diskStates[shard.ID] = ds
+			loaded, err := ds.load()
+			if err != nil {
+				log.Printf("disk state load failed shard_id=%s err=%v", shard.ID, err)
+			} else if loaded.Valid {
+				r.KV.ApplySnapshot(loaded.KV)
+				r.Version = loaded.Version
+				r.Term = loaded.Term
+				r.IsReady = true // disk state means we don't need network recovery
+				r.BootstrapShardID = ""
+				r.BootstrapLeaderAddr = ""
+				log.Printf("disk state restored shard_id=%s version=%d term=%d", shard.ID, loaded.Version, loaded.Term)
+			}
+		}
+	}
+
+	s.replicas[shard.ID] = r
+	log.Printf("shard initialized shard_id=%s role=%s leader=%s is_ready=%v", shard.ID, r.Role, r.LeaderID, r.IsReady)
+}
+
+// startShardGoroutines launches the per-replica background goroutines for shard
+// shardID.  serverCtx must already be stored on s.  Must NOT hold s.mu.
+func (s *Server) startShardGoroutines(shardID string) {
+	s.mu.Lock()
+	r, ok := s.replicas[shardID]
+	ctx := s.serverCtx
+	s.mu.Unlock()
+	if !ok || ctx == nil {
+		return
+	}
+
+	r.mu.Lock()
+	r.LastLeaderContact = s.clock.Now()
+	r.mu.Unlock()
+
+	replicaCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.cancelFuncs[shardID] = cancel
+	s.mu.Unlock()
+
+	// Start recovery for any not-ready replica, including bootstrap leaders.
+	if !r.IsReady {
+		go runRecoveryLoop(replicaCtx, r, func() string {
+			return s.leaderAddrForReplica(r)
+		}, s.m)
+	}
+	go s.runElectionTimer(replicaCtx, r)
+	go s.runLeaderHeartbeat(replicaCtx, r)
+}
+
+// dropShard stops all goroutines for a shard and removes it from this node.
+// It is safe to call even if the shard is not present.
+// Must NOT hold s.mu.
+func (s *Server) dropShard(shardID string) {
+	s.mu.Lock()
+	cancel, hasCancel := s.cancelFuncs[shardID]
+	delete(s.cancelFuncs, shardID)
+	ds := s.diskStates[shardID]
+	delete(s.diskStates, shardID)
+	delete(s.replicas, shardID)
+	delete(s.shardLeaders, shardID)
+	s.mu.Unlock()
+
+	if hasCancel {
+		cancel()
+	}
+	if ds != nil {
+		if err := ds.close(); err != nil {
+			log.Printf("disk state close error shard_id=%s err=%v", shardID, err)
+		}
+	}
+	log.Printf("shard dropped shard_id=%s node_id=%s", shardID, s.cfg.Node.ID)
 }
 
 // shardDataDir returns the directory for a shard's WAL and snapshot.
@@ -194,9 +293,13 @@ func (s *Server) StartOnListener(ctx context.Context, l net.Listener) error {
 }
 
 func (s *Server) startBackgroundJobs(ctx context.Context) {
+	s.mu.Lock()
+	s.serverCtx = ctx
+	s.mu.Unlock()
+
 	go s.runHeartbeat(ctx)
 	// Start per-replica background goroutines.
-	s.mu.RLock()
+	s.mu.Lock()
 	for _, r := range s.replicas {
 		r := r
 		// Seed the election timer so the replica doesn't immediately call an
@@ -204,17 +307,19 @@ func (s *Server) startBackgroundJobs(ctx context.Context) {
 		r.mu.Lock()
 		r.LastLeaderContact = s.clock.Now()
 		r.mu.Unlock()
+		replicaCtx, cancel := context.WithCancel(ctx)
+		s.cancelFuncs[r.ShardID] = cancel
 		// Phase 3: incremental recovery for not-ready followers.
 		if r.Role == RoleFollower && !r.IsReady {
-			go runRecoveryLoop(ctx, r, func() string {
+			go runRecoveryLoop(replicaCtx, r, func() string {
 				return s.leaderAddrForReplica(r)
 			}, s.m)
 		}
 		// Phase 4: election timer and leader heartbeat run for every replica.
-		go s.runElectionTimer(ctx, r)
-		go s.runLeaderHeartbeat(ctx, r)
+		go s.runElectionTimer(replicaCtx, r)
+		go s.runLeaderHeartbeat(replicaCtx, r)
 	}
-	s.mu.RUnlock()
+	s.mu.Unlock()
 	// Reliability: update staleness gauges and replica version/term gauges.
 	go s.runMetricsUpdater(ctx)
 }
@@ -800,7 +905,8 @@ func (s *Server) sendHeartbeat() {
 }
 
 // refetchShardMap pulls an updated shard map from the coordinator and applies
-// any leader or role changes to existing replicas.
+// any leader or role changes to existing replicas. Phase 5: also detects
+// newly-assigned shards (calls initShardLocked) and removed shards (dropShard).
 func (s *Server) refetchShardMap() {
 	url := "http://" + s.cfg.CoordinatorAddress + "/shardmap"
 	resp, err := http.Get(url) //nolint:noctx
@@ -815,33 +921,80 @@ func (s *Server) refetchShardMap() {
 		return
 	}
 
+	// Collect shard IDs this node should now host.
+	shouldHost := make(map[string]shardmap.ShardInfo, len(smResp.Shards))
+	for _, shard := range smResp.Shards {
+		if shard.HasReplica(s.cfg.Node.ID) {
+			shouldHost[shard.ID] = shard
+		}
+	}
+
 	s.mu.Lock()
 	s.nodeAddresses = smResp.NodeAddresses
 	s.shardMapVersion = smResp.Version
+	// Update shard leader index.
 	for _, shard := range smResp.Shards {
-		r := s.replicas[shard.ID]
-		if r == nil {
-			continue
+		s.shardLeaders[shard.ID] = shard.Leader
+	}
+
+	// Collect shards currently hosted that are no longer in shouldHost.
+	var toRemove []string
+	for shardID := range s.replicas {
+		if _, ok := shouldHost[shardID]; !ok {
+			toRemove = append(toRemove, shardID)
 		}
-		r.mu.Lock()
-		oldLeader := r.LeaderID
-		r.LeaderID = shard.Leader
-		if shard.Leader == s.cfg.Node.ID && r.Role != RoleLeader {
-			r.Role = RoleLeader
-			r.IsReady = true
-			log.Printf("promoted to leader shard_id=%s", shard.ID)
-		} else if shard.Leader != s.cfg.Node.ID && r.Role == RoleLeader {
-			r.Role = RoleFollower
-			log.Printf("demoted to follower shard_id=%s", shard.ID)
+	}
+
+	// Collect newly-assigned shards.
+	var newShardIDs []string
+	for shardID, shard := range shouldHost {
+		if _, exists := s.replicas[shardID]; exists {
+			// Existing replica: update leader/role/peers.
+			r := s.replicas[shardID]
+			r.mu.Lock()
+			oldLeader := r.LeaderID
+			r.LeaderID = shard.Leader
+			// Update peer list in case replicas changed (migration window).
+			peers := make([]string, 0, len(shard.Replicas)-1)
+			for _, rid := range shard.Replicas {
+				if rid != s.cfg.Node.ID {
+					peers = append(peers, rid)
+				}
+			}
+			r.Peers = peers
+			if shard.Leader == s.cfg.Node.ID && r.Role != RoleLeader {
+				r.Role = RoleLeader
+				// Phase 5: don't mark ready yet if bootstrap recovery is still
+				// pending — the recovery loop will set IsReady once it completes.
+				if r.BootstrapShardID == "" {
+					r.IsReady = true
+				}
+				log.Printf("promoted to leader shard_id=%s", shard.ID)
+			} else if shard.Leader != s.cfg.Node.ID && r.Role == RoleLeader {
+				r.Role = RoleFollower
+				log.Printf("demoted to follower shard_id=%s", shard.ID)
+			}
+			if r.LeaderID != oldLeader {
+				log.Printf("leader changed shard_id=%s old=%s new=%s", shard.ID, oldLeader, r.LeaderID)
+				r.LastLeaderContact = s.clock.Now()
+			}
+			r.mu.Unlock()
+		} else {
+			// Brand-new shard for this node.
+			s.initShardLocked(shard, smResp)
+			newShardIDs = append(newShardIDs, shardID)
 		}
-		if r.LeaderID != oldLeader {
-			log.Printf("leader changed shard_id=%s old=%s new=%s", shard.ID, oldLeader, r.LeaderID)
-			// Phase 4: learning about a new leader resets the election timer.
-			r.LastLeaderContact = s.clock.Now()
-		}
-		r.mu.Unlock()
 	}
 	s.mu.Unlock()
+
+	// Start goroutines for new shards (must not hold lock).
+	for _, shardID := range newShardIDs {
+		s.startShardGoroutines(shardID)
+	}
+	// Drop removed shards (must not hold lock).
+	for _, shardID := range toRemove {
+		s.dropShard(shardID)
+	}
 }
 
 

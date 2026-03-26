@@ -31,10 +31,18 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 	replica.mu.RLock()
 	shardID := replica.ShardID
 	sinceVersion := replica.Version
+	bootstrapShardID := replica.BootstrapShardID
 	replica.mu.RUnlock()
 
+	// For shard splits: fetch data from the bootstrap source shard instead.
+	recoverShardID := shardID
+	if bootstrapShardID != "" {
+		recoverShardID = bootstrapShardID
+		sinceVersion = 0 // always start fresh from the source
+	}
+
 	url := fmt.Sprintf("http://%s/internal/recover/%s?since_version=%d",
-		leaderAddr, shardID, sinceVersion)
+		leaderAddr, recoverShardID, sinceVersion)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("build recover request: %w", err)
@@ -75,6 +83,9 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 			replica.RepLog.Append(e)
 		}
 		replica.IsReady = true
+		// Clear bootstrap hint now that first recovery succeeded.
+		replica.BootstrapShardID = ""
+		replica.BootstrapLeaderAddr = ""
 		log.Printf("incremental recovery complete shard_id=%s version=%d entries=%d",
 			shardID, replica.Version, len(recoverResp.Entries))
 		return "incremental", nil
@@ -84,6 +95,9 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		replica.Version = recoverResp.Version
 		replica.Term = recoverResp.Term
 		replica.IsReady = true
+		// Clear bootstrap hint now that first recovery succeeded.
+		replica.BootstrapShardID = ""
+		replica.BootstrapLeaderAddr = ""
 		log.Printf("snapshot fallback recovery complete shard_id=%s version=%d term=%d",
 			shardID, recoverResp.Version, recoverResp.Term)
 		return "snapshot", nil
@@ -112,11 +126,21 @@ func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr f
 			replica.mu.RLock()
 			ready := replica.IsReady
 			shardID := replica.ShardID
+			bootstrapAddr := replica.BootstrapLeaderAddr
+			hasBootstrap := replica.BootstrapShardID != ""
 			replica.mu.RUnlock()
 			if ready {
 				return
 			}
 			leaderAddr := getLeaderAddr()
+			// For shard splits: always use the bootstrap leader address while
+			// bootstrapping.  The normal leader might be this node itself,
+			// which does not hold the source shard data.
+			if hasBootstrap && bootstrapAddr != "" {
+				leaderAddr = bootstrapAddr
+			} else if leaderAddr == "" {
+				leaderAddr = bootstrapAddr
+			}
 			if leaderAddr == "" {
 				continue
 			}

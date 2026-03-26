@@ -144,6 +144,23 @@ func (m *Membership) AliveNodes() []string {
 	return alive
 }
 
+// AddNode registers a new node in the membership map.
+// If the node already exists, its address is updated but live state is preserved.
+func (m *Membership) AddNode(spec config.NodeSpec) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.nodes[spec.ID]; ok {
+		m.nodes[spec.ID].Address = spec.Address
+		return
+	}
+	m.nodes[spec.ID] = &NodeStatus{
+		ID:            spec.ID,
+		Address:       spec.Address,
+		IsAlive:       false,
+		ShardVersions: make(map[string]uint64),
+	}
+}
+
 // VersionForShard returns the last reported version of a shard on a given node.
 // Returns 0 if unknown.
 func (m *Membership) VersionForShard(nodeID, shardID string) uint64 {
