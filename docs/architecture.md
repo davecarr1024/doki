@@ -65,6 +65,16 @@ doki/
 │   ├── storage/              # Storage interface + implementations
 │   │   └── memory/           # In-memory storage engine
 │   └── wal/                  # Write-ahead log (Phase 2)
+├── internal/
+│   ├── sql/                  # SQL compiler pipeline (Phase 6-9)
+│   │   ├── token.go          # Token types
+│   │   ├── lexer.go          # Tokenizer
+│   │   ├── ast.go            # AST node types
+│   │   ├── parser.go         # Recursive descent parser
+│   │   ├── catalog.go        # Schema catalog + KV row encoding
+│   │   ├── analyzer.go       # Semantic analysis + type checking
+│   │   ├── planner.go        # Physical plan generation + optimizer
+│   │   └── executor.go       # Plan execution against KV interface
 ├── test/
 │   ├── integration/          # End-to-end tests (real servers, no Docker)
 │   └── reliability/          # Chaos, load, and monkey tests (build tag: reliability)
@@ -419,6 +429,65 @@ Each shard's `ReplicaState` is protected by its own `sync.RWMutex`. No shard loc
 Each shard also has its own `context.CancelFunc` stored in the node's `cancelFuncs` map. When a shard is removed (e.g. after migration away), `dropShard` cancels the context, stopping all background goroutines for that shard cleanly.
 
 The coordinator uses a single `sync.RWMutex` for its state — acceptable in v1.
+
+---
+
+## SQL Compiler Pipeline (Phase 6-9)
+
+The SQL layer sits above the KV engine. It compiles SQL text into KV operations through a standard compiler pipeline:
+
+```mermaid
+flowchart LR
+    SQL["SQL text"] --> LEX["Lexer\n(token.go)"]
+    LEX --> PAR["Parser\n(parser.go)"]
+    PAR --> ANA["Analyzer\n(analyzer.go)"]
+    ANA --> PLN["Planner\n(planner.go)"]
+    PLN --> EXE["Executor\n(executor.go)"]
+    EXE --> KV["KV Interface"]
+    CAT["Catalog\n(catalog.go)"] --> ANA
+    CAT --> EXE
+```
+
+### Stages
+
+| Stage | Input | Output | Responsibility |
+|-------|-------|--------|---------------|
+| Lexer | SQL string | `[]Token` | Tokenise; skip whitespace and `--` comments |
+| Parser | `[]Token` | `Statement` (AST) | Recursive descent; grammar for CREATE/INSERT/SELECT/UPDATE/DELETE |
+| Analyzer | `Statement` + `Catalog` | `ResolvedStatement` | Name resolution, type checking, PK WHERE enforcement |
+| Planner | `ResolvedStatement` | `PhysicalPlan` | Map to KV operations; optimize PK WHERE → PointGet |
+| Executor | `PhysicalPlan` + `KV` + `Catalog` | `*ResultSet` | Execute KV ops; encode/decode JSON rows; project columns |
+
+### Physical Plan Types
+
+| Plan | KV Operation | When used |
+|------|-------------|-----------|
+| `PointGet` | `kv.Get(table/pk)` | SELECT WHERE pk = ? |
+| `TableScan` | `kv.Scan(table/)` | SELECT with no WHERE |
+| `InsertPlan` | `kv.Put(table/pk, row)` | INSERT |
+| `PointUpdate` | `kv.Get` + `kv.Put` | UPDATE WHERE pk = ? |
+| `PointDelete` | `kv.Delete(table/pk)` | DELETE WHERE pk = ? |
+| `CreateTablePlan` | `catalog.CreateTable` | CREATE TABLE |
+
+### KV Encoding
+
+Rows are stored as JSON at keys of the form `table/pk_value`:
+```
+key:   "users/42"
+value: {"id":42,"name":"alice","active":true}
+```
+
+### Supported SQL (v1)
+
+```sql
+CREATE TABLE users (id INT PRIMARY KEY, name TEXT NOT NULL, active BOOL);
+INSERT INTO users VALUES (1, 'alice', true);
+INSERT INTO users (id, name) VALUES (2, 'bob');
+SELECT * FROM users;
+SELECT id, name FROM users WHERE id = 1;
+UPDATE users SET name = 'alice2' WHERE id = 1;
+DELETE FROM users WHERE id = 1;
+```
 
 ---
 

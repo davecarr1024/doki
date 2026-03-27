@@ -38,17 +38,35 @@ doki/
 ├── internal/                       # shared packages (not importable externally)
 │   ├── clock/                      # Clock interface for testable time
 │   ├── config/                     # Config types and YAML loading
+│   ├── metrics/                    # Prometheus metrics definitions
+│   ├── replicationlog/             # Bounded circular replication log (Phase 3)
 │   ├── shardmap/                   # ShardMap types and operations
-│   └── storage/                    # Storage interface + implementations
-│       └── memory/                 # In-memory storage engine
+│   ├── snapshot/                   # Atomic disk snapshot (Phase 2)
+│   ├── sql/                        # SQL compiler pipeline (Phase 6-9)
+│   │   ├── token.go                # Token types
+│   │   ├── lexer.go                # Tokenizer
+│   │   ├── ast.go                  # AST node types
+│   │   ├── parser.go               # Recursive descent parser
+│   │   ├── catalog.go              # Schema catalog + KV encoding
+│   │   ├── analyzer.go             # Semantic analysis + type checking
+│   │   ├── planner.go              # Physical plan generation + optimization
+│   │   └── executor.go             # Plan execution against KV interface
+│   ├── storage/                    # Storage interface + implementations
+│   │   └── memory/                 # In-memory storage engine
+│   └── wal/                        # Write-ahead log (Phase 2)
 ├── coordinator/                    # Coordinator process
 │   ├── main.go
-│   ├── membership.go               # Node heartbeat tracking
+│   ├── membership.go               # Node heartbeat tracking + dynamic join
 │   ├── leader.go                   # Leader assignment
+│   ├── migration.go                # MigrationManager: live shard migration/split (Phase 5)
 │   └── server.go                   # HTTP server + handlers
 ├── node/                           # Leaf node process
 │   ├── main.go
 │   ├── replica.go                  # Per-shard replica state
+│   ├── election.go                 # Distributed leader election (Phase 4)
+│   ├── recovery.go                 # Incremental + bootstrap recovery (Phase 3/5)
+│   ├── replication.go              # Quorum replication fan-out
+│   ├── diskstate.go                # WAL + snapshot per shard (Phase 2)
 │   └── server.go                   # HTTP server + handlers
 ├── test/
 │   ├── integration/                # Integration tests (real servers, no Docker)
@@ -72,8 +90,13 @@ The project is built incrementally. Know which phase you are in before adding co
 | 2 | Complete | WAL + durability, disk snapshots, restart recovery |
 | 3 | Complete | Incremental replication log |
 | 4 | Complete | Distributed leader election |
-| 5 | **Current** | Dynamic sharding |
-| 6 | Planned | SQL layer |
+| 5 | Complete | Dynamic sharding (add_node, migrate_shard, split_shard) |
+| 6 | Complete | SQL lexer, parser, AST, and schema catalog |
+| 7 | Complete | SQL analyzer and type system |
+| 8 | Complete | SQL planner and optimizer (PointGet, TableScan, etc.) |
+| 9 | **Current** | SQL executor (full Parse→Analyze→Plan→Execute pipeline) |
+| 10 | Planned | Secondary indexes |
+| 11 | Planned | Multi-row transactions |
 
 **Rule:** Do not implement Phase N+1 concepts while working in Phase N.
 

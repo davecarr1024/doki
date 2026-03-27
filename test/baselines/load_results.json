@@ -1,0 +1,26 @@
+[
+  {
+    "test_name": "baseline_throughput",
+    "recorded_at": "2026-03-27T17:38:13.716601712Z",
+    "throughput_wps": 562.5815888243708,
+    "p50_ms": 7.981558999999999,
+    "p99_ms": 18.882476,
+    "success_rate_pct": 100
+  },
+  {
+    "test_name": "load_under_leader_failure",
+    "recorded_at": "2026-03-27T17:38:30.026593543Z",
+    "throughput_wps": 491.30839315716474,
+    "p50_ms": 5.0047690000000005,
+    "p99_ms": 13.905466,
+    "success_rate_pct": 100
+  },
+  {
+    "test_name": "high_concurrency_20_writers",
+    "recorded_at": "2026-03-27T17:38:41.101533627Z",
+    "throughput_wps": 571.4172164981467,
+    "p50_ms": 32.387622,
+    "p99_ms": 58.483141,
+    "success_rate_pct": 100
+  }
+]

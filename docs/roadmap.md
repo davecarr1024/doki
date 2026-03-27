@@ -232,7 +232,7 @@ node/server.go                   initShardLocked, startShardGoroutines, dropShar
 
 ---
 
-## Phase 6: SQL — Lexer, Parser, and Schema
+## Phase 6: SQL — Lexer, Parser, and Schema ✅ Complete
 
 **Theme:** Turn SQL text into a structured representation the system can work with.
 
@@ -380,9 +380,17 @@ This encoding is simple to implement and inspect. Row-level encoding (like colum
 - `DELETE WHERE pk = ?` calls `Delete`
 - Invalid SQL (syntax error, unknown table, wrong column) returns a descriptive error
 
+**What Was Built:**
+- `internal/sql/token.go`: 30+ token type constants (keywords, identifiers, literals, punctuation) and `Token` struct
+- `internal/sql/lexer.go`: `Lex(input string) ([]Token, error)` — hand-written scanner; case-insensitive keywords; single-quoted strings with `''` escape; `--` line comments
+- `internal/sql/ast.go`: `Statement` and `Expr` interfaces; `CreateTableStmt`, `InsertStmt`, `SelectStmt`, `UpdateStmt`, `DeleteStmt`, `BinaryExpr`, `ColumnRef`, `Literal`, `StarExpr`, `Assignment`
+- `internal/sql/catalog.go`: `ColumnType` (TypeInt/TypeText/TypeBool), `ColumnDef`, `TableDef`, `Catalog` interface, thread-safe `inMemoryCatalog`, `RowKey`/`EncodeRow`/`DecodeRow` helpers
+- `internal/sql/parser.go`: `Parse(input string) (Statement, error)` — recursive descent; full expression grammar (binary ops, AND/OR, all comparison operators, parentheses, NULL/TRUE/FALSE literals)
+- 52 passing unit tests (lexer, parser, catalog)
+
 ---
 
-## Phase 7: SQL — Analyzer and Type System
+## Phase 7: SQL — Analyzer and Type System ✅ Complete
 
 **Theme:** Validate the AST against the schema; catch errors before execution.
 
@@ -416,9 +424,14 @@ flowchart TD
 | INSERT column count | `INSERT has 3 columns but 2 values` |
 | NOT NULL | `null value in column "name" violates not-null constraint` |
 
+**What Was Built:**
+- `internal/sql/analyzer.go`: `Analyze(stmt Statement, cat Catalog) (ResolvedStatement, error)` — produces `ResolvedCreateTable`, `ResolvedInsert`, `ResolvedSelect`, `ResolvedUpdate`, `ResolvedDelete` with `TypedExpr` annotations and `ResolvedWhere` for PK equality predicates
+- All semantic checks from table above implemented with descriptive error messages
+- 21 passing unit tests covering happy paths and all error cases
+
 ---
 
-## Phase 8: SQL — Planner and Optimizer
+## Phase 8: SQL — Planner and Optimizer ✅ Complete
 
 **Theme:** Convert the resolved AST into an efficient execution plan.
 
@@ -491,9 +504,15 @@ type KVDelete struct { Key string }
 type KVScan   struct { Prefix string; Decode func([]byte) Row }  // future
 ```
 
+**What Was Built:**
+- `internal/sql/planner.go`: `Plan(rs ResolvedStatement) (PhysicalPlan, error)` with physical plan types: `CreateTablePlan`, `InsertPlan`, `PointGet`, `PointPut`, `PointDelete`, `PointUpdate`, `TableScan`
+- Optimizer rules: SELECT with PK = literal WHERE → `PointGet`; SELECT no WHERE → `TableScan`; INSERT → `InsertPlan`; UPDATE → `PointUpdate`; DELETE → `PointDelete`
+- `evalLiteralToString` converts int64/string/bool literals to KV key strings
+- 8 passing unit tests covering all plan types
+
 ---
 
-## Phase 9: SQL — Executor
+## Phase 9: SQL — Executor ✅ Complete
 
 **Theme:** Execute physical plans against the KV engine and return results.
 
@@ -574,6 +593,13 @@ sequenceDiagram
 - Optimizer converts PK WHERE to PointGet (verified via plan inspection)
 - Executor returns correct ResultSet for each statement type
 - Error propagation from KV layer (NOT_FOUND, QUORUM_UNAVAILABLE) surfaces as SQL error
+
+**What Was Built:**
+- `internal/sql/executor.go`: `KV` interface (Get/Put/Delete/Scan), `KVEntry`, `ErrNotFound`, `ResultSet{Columns, Rows, RowsAffected}`, `Execute(plan PhysicalPlan, kv KV, cat Catalog) (*ResultSet, error)`
+- Handles all plan types: `CreateTablePlan` → catalog.CreateTable; `InsertPlan` → kv.Put; `PointGet` → kv.Get + decode + project; `TableScan` → kv.Scan + decode + project all rows; `PointUpdate` → kv.Get + mutate + kv.Put; `PointDelete` → kv.Delete
+- Column projection: nil = all columns in table definition order; explicit = named columns in that order
+- 10 end-to-end tests using `inMemoryKV` exercising the full `Parse → Analyze → Plan → Execute` pipeline
+- All 100 SQL package tests pass; all existing reliability tests still pass
 
 ---
 
