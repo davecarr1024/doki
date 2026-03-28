@@ -124,7 +124,7 @@ type NodeMetrics struct {
 	WriteDuration *prometheus.HistogramVec
 
 	// ReplicationsTotal counts incoming replication operations by result.
-	// result labels: "ok", "stale_term", "wal_error", "duplicate"
+	// result labels: "apply_ok", "stale_term", "wal_error", "duplicate", "gap"
 	ReplicationsTotal *prometheus.CounterVec
 
 	// ElectionsTotal counts elections by result.

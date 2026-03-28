@@ -11,6 +11,7 @@ import (
 
 	"github.com/davecarr1024/doki/coordinator"
 	"github.com/davecarr1024/doki/internal/config"
+	"github.com/davecarr1024/doki/internal/replicationlog"
 	"github.com/davecarr1024/doki/internal/shardmap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -29,8 +30,8 @@ func testNodeCfg(id string) *config.NodeConfig {
 
 func testShardMapResp(shardID, leaderID string, replicas []string, addrs map[string]string) coordinator.ShardMapResponse {
 	return coordinator.ShardMapResponse{
-		Version: 1,
-		Shards:  []shardmap.ShardInfo{{ID: shardID, Leader: leaderID, Replicas: replicas}},
+		Version:       1,
+		Shards:        []shardmap.ShardInfo{{ID: shardID, Leader: leaderID, Replicas: replicas}},
 		NodeAddresses: addrs,
 	}
 }
@@ -91,7 +92,7 @@ func TestFanOutReplicate_NoFollowers(t *testing.T) {
 	acks := fanOutReplicate(context.Background(), "shard-0", ReplicateRequest{
 		Term: 1, Version: 1, Op: "put", Key: "k", Value: "v",
 	}, nil, time.Second)
-	assert.Equal(t, 0, acks)
+	assert.Len(t, acks, 0)
 }
 
 func TestFanOutReplicate_AllAck(t *testing.T) {
@@ -105,11 +106,14 @@ func TestFanOutReplicate_AllAck(t *testing.T) {
 	defer s1.Close()
 	defer s2.Close()
 
-	peers := []string{s1.Listener.Addr().String(), s2.Listener.Addr().String()}
+	peers := map[string]string{
+		"p1": s1.Listener.Addr().String(),
+		"p2": s2.Listener.Addr().String(),
+	}
 	acks := fanOutReplicate(context.Background(), "shard-0", ReplicateRequest{
 		Term: 1, Version: 2, Op: "put", Key: "x", Value: "y",
 	}, peers, time.Second)
-	assert.Equal(t, 2, acks)
+	assert.Len(t, acks, 2)
 }
 
 func TestFanOutReplicate_PartialAck(t *testing.T) {
@@ -124,11 +128,14 @@ func TestFanOutReplicate_PartialAck(t *testing.T) {
 	}))
 	defer bad.Close()
 
-	peers := []string{good.Listener.Addr().String(), bad.Listener.Addr().String()}
+	peers := map[string]string{
+		"good": good.Listener.Addr().String(),
+		"bad":  bad.Listener.Addr().String(),
+	}
 	acks := fanOutReplicate(context.Background(), "shard-0", ReplicateRequest{
 		Term: 1, Version: 3, Op: "delete", Key: "x",
 	}, peers, time.Second)
-	assert.Equal(t, 1, acks)
+	assert.Len(t, acks, 1)
 }
 
 func TestFanOutReplicate_Timeout(t *testing.T) {
@@ -138,59 +145,20 @@ func TestFanOutReplicate_Timeout(t *testing.T) {
 	}))
 	defer slow.Close()
 
-	peers := []string{slow.Listener.Addr().String()}
+	peers := map[string]string{"slow": slow.Listener.Addr().String()}
 	start := time.Now()
 	acks := fanOutReplicate(context.Background(), "shard-0", ReplicateRequest{
 		Term: 1, Version: 1, Op: "put", Key: "k", Value: "v",
 	}, peers, 80*time.Millisecond)
 	elapsed := time.Since(start)
 
-	assert.Equal(t, 0, acks)
+	assert.Len(t, acks, 0)
 	assert.Less(t, elapsed, time.Second, "should return quickly after timeout")
 }
 
-// --- fanOutCommit ---
+// --- handleReplicate ---
 
-func TestFanOutCommit_AllAck(t *testing.T) {
-	makeFollower := func() *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(CommitResponse{Success: true, Term: 1})
-		}))
-	}
-	s1, s2 := makeFollower(), makeFollower()
-	defer s1.Close()
-	defer s2.Close()
-
-	peers := []string{s1.Listener.Addr().String(), s2.Listener.Addr().String()}
-	acks := fanOutCommit(context.Background(), "shard-0", CommitRequest{
-		Term: 1, Version: 2,
-	}, peers, time.Second)
-	assert.Equal(t, 2, acks)
-}
-
-func TestFanOutCommit_PartialAck(t *testing.T) {
-	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(CommitResponse{Success: true, Term: 1})
-	}))
-	defer good.Close()
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Error: "missing"})
-	}))
-	defer bad.Close()
-
-	peers := []string{good.Listener.Addr().String(), bad.Listener.Addr().String()}
-	acks := fanOutCommit(context.Background(), "shard-0", CommitRequest{
-		Term: 1, Version: 3,
-	}, peers, time.Second)
-	assert.Equal(t, 1, acks)
-}
-
-// --- handleReplicate / handleCommit ---
-
-func TestHandleReplicate_StagesWrite(t *testing.T) {
+func TestHandleReplicate_AppliesWrite(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
 	ts := httptest.NewServer(follower.Handler())
 	defer ts.Close()
@@ -206,46 +174,11 @@ func TestHandleReplicate_StagesWrite(t *testing.T) {
 	assert.True(t, rr.Success)
 
 	val, ok := follower.getKV("shard-0", "hello")
-	assert.False(t, ok, "write should not be applied before commit")
-	assert.Empty(t, val)
-
-	follower.mu.RLock()
-	replica := follower.replicas["shard-0"]
-	follower.mu.RUnlock()
-	require.NotNil(t, replica)
-	replica.mu.RLock()
-	_, pending := replica.Pending[1]
-	replica.mu.RUnlock()
-	assert.True(t, pending, "pending entry should be staged")
-}
-
-func TestHandleCommit_AppliesWrite(t *testing.T) {
-	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
-
-	appendReq := ReplicateRequest{Term: 1, Version: 1, Op: "put", Key: "hello", Value: "world"}
-	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(appendReq))
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
-
-	commitReq := CommitRequest{Term: 1, Version: 1}
-	commitResp, err := http.Post(ts.URL+"/internal/commit/shard-0", "application/json", jsonBody(commitReq))
-	require.NoError(t, err)
-	defer func() { _ = commitResp.Body.Close() }()
-	require.Equal(t, http.StatusOK, commitResp.StatusCode)
-
-	var cr CommitResponse
-	require.NoError(t, json.NewDecoder(commitResp.Body).Decode(&cr))
-	assert.True(t, cr.Success)
-
-	val, ok := follower.getKV("shard-0", "hello")
 	require.True(t, ok)
 	assert.Equal(t, "world", val)
 }
 
-func TestHandleCommit_Delete(t *testing.T) {
+func TestHandleReplicate_Delete(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
 	follower.setKV("shard-0", "gone", "value")
 	ts := httptest.NewServer(follower.Handler())
@@ -256,16 +189,6 @@ func TestHandleCommit_Delete(t *testing.T) {
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
 	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	commitReq := CommitRequest{Term: 1, Version: 1}
-	commitResp, err := http.Post(ts.URL+"/internal/commit/shard-0", "application/json", jsonBody(commitReq))
-	require.NoError(t, err)
-	defer func() { _ = commitResp.Body.Close() }()
-	require.Equal(t, http.StatusOK, commitResp.StatusCode)
-
-	var cr CommitResponse
-	require.NoError(t, json.NewDecoder(commitResp.Body).Decode(&cr))
-	assert.True(t, cr.Success)
 
 	_, ok := follower.getKV("shard-0", "gone")
 	assert.False(t, ok, "key should have been deleted")
@@ -288,6 +211,86 @@ func TestHandleReplicate_StaleTerm(t *testing.T) {
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
 	assert.False(t, rr.Success)
 	assert.Equal(t, uint64(5), rr.Term, "should echo the follower's current term")
+}
+
+func TestHandleReplicate_GapTriggersRecovery(t *testing.T) {
+	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
+	ts := httptest.NewServer(follower.Handler())
+	defer ts.Close()
+
+	// Send a replicate with a gap (version 3 before version 1/2).
+	req := ReplicateRequest{Term: 1, Version: 3, Op: "put", Key: "k", Value: "v"}
+	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+
+	var rr ReplicateResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
+	assert.False(t, rr.Success)
+
+	follower.mu.RLock()
+	replica := follower.replicas["shard-0"]
+	follower.mu.RUnlock()
+	require.NotNil(t, replica)
+	replica.mu.RLock()
+	isReady := replica.IsReady
+	replica.mu.RUnlock()
+	assert.False(t, isReady, "gap should mark replica not-ready")
+}
+
+func TestHandleForceRecover_MarksNotReadyAndResetsLog(t *testing.T) {
+	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
+	ts := httptest.NewServer(follower.Handler())
+	defer ts.Close()
+
+	follower.mu.RLock()
+	replica := follower.replicas["shard-0"]
+	follower.mu.RUnlock()
+	require.NotNil(t, replica)
+	replica.mu.Lock()
+	replica.IsReady = true
+	replica.RepLog.Append(replicationlog.Entry{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v"})
+	replica.mu.Unlock()
+
+	resp, err := http.Post(ts.URL+"/internal/force_recover/shard-0", "application/json", nil)
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	replica.mu.RLock()
+	isReady := replica.IsReady
+	logLen := replica.RepLog.Len()
+	replica.mu.RUnlock()
+	assert.False(t, isReady)
+	assert.Equal(t, 0, logLen)
+}
+
+func TestHandleRecover_FollowerAheadGetsSnapshot(t *testing.T) {
+	leader := newTestServer("leader", "leader", []string{"leader"})
+	ts := httptest.NewServer(leader.Handler())
+	defer ts.Close()
+
+	leader.mu.RLock()
+	replica := leader.replicas["shard-0"]
+	leader.mu.RUnlock()
+	require.NotNil(t, replica)
+	replica.mu.Lock()
+	err := applyReplicatedEntryLocked(replica, replicationlog.Entry{
+		Term: 1, Version: 1, Op: "put", Key: "k", Value: "v",
+	}, nil)
+	replica.mu.Unlock()
+	require.NoError(t, err)
+
+	resp, err := http.Get(ts.URL + "/internal/recover/shard-0?since_version=2")
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	var rr RecoverResponse
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
+	assert.Equal(t, "snapshot", rr.Type)
+	assert.Equal(t, uint64(1), rr.Version)
+	assert.Equal(t, "v", rr.KV["k"])
 }
 
 func TestHandleReplicate_UnknownShard(t *testing.T) {

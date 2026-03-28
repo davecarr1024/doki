@@ -27,7 +27,7 @@ type SyncResponse struct {
 //
 // Returns the recovery type ("incremental" or "snapshot") on success, or an error.
 // On success the replica is marked ready.
-func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAddr string) (string, error) {
+func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAddr string, ds *diskState) (string, error) {
 	replica.mu.RLock()
 	shardID := replica.ShardID
 	sinceVersion := replica.Version
@@ -70,21 +70,11 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 			if e.Version <= replica.Version {
 				continue
 			}
-			switch e.Op {
-			case "put":
-				replica.KV.Put(e.Key, e.Value)
-			case "delete":
-				replica.KV.Delete(e.Key)
+			if err := applyReplicatedEntryLocked(replica, e, ds); err != nil {
+				return "", fmt.Errorf("apply entry: %w", err)
 			}
-			replica.Version = e.Version
-			if e.Term > replica.Term {
-				replica.Term = e.Term
-			}
-			replica.RepLog.Append(e)
 		}
 		replica.IsReady = true
-		replica.LastLogVersion = replica.Version
-		clear(replica.Pending)
 		// Clear bootstrap hint now that first recovery succeeded.
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""
@@ -97,8 +87,12 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		replica.Version = recoverResp.Version
 		replica.Term = recoverResp.Term
 		replica.IsReady = true
-		replica.LastLogVersion = replica.Version
-		clear(replica.Pending)
+		replica.RepLog.Reset()
+		if ds != nil {
+			if err := ds.resetSnapshot(recoverResp.Term, recoverResp.Version, recoverResp.KV); err != nil {
+				return "", fmt.Errorf("disk snapshot reset: %w", err)
+			}
+		}
 		// Clear bootstrap hint now that first recovery succeeded.
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""
@@ -112,14 +106,15 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 }
 
 // runRecoveryLoop periodically attempts recovery for a not-ready follower replica.
-// It exits once the replica is marked ready or the context is cancelled.
+// It continues running until the context is cancelled so replicas can be forced
+// back into recovery later.
 // getLeaderAddr is called each iteration so it always uses the current leader.
 // m is used to record recovery type metrics; pass nil to skip metric recording.
 //
 // Phase 3: recovery attempts incremental log-based catch-up first via
 // /internal/recover. The leader falls back to a full snapshot automatically
 // when the follower's gap exceeds the replication log size.
-func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr func() string, m *metrics.NodeMetrics) {
+func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr func() string, m *metrics.NodeMetrics, ds *diskState) {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
 	for {
@@ -134,7 +129,7 @@ func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr f
 			hasBootstrap := replica.BootstrapShardID != ""
 			replica.mu.RUnlock()
 			if ready {
-				return
+				continue
 			}
 			leaderAddr := getLeaderAddr()
 			// For shard splits: always use the bootstrap leader address while
@@ -148,7 +143,7 @@ func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr f
 			if leaderAddr == "" {
 				continue
 			}
-			recoveryType, err := doIncrementalRecovery(ctx, replica, leaderAddr)
+			recoveryType, err := doIncrementalRecovery(ctx, replica, leaderAddr, ds)
 			if err != nil {
 				log.Printf("recovery attempt failed shard_id=%s err=%v", shardID, err)
 			} else {

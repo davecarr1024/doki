@@ -15,7 +15,7 @@ import "sync"
 type Entry struct {
 	Term    uint64 `json:"term"`
 	Version uint64 `json:"version"`
-	Op      string `json:"op"`             // "put" or "delete"
+	Op      string `json:"op"` // "put" or "delete"
 	Key     string `json:"key"`
 	Value   string `json:"value,omitempty"` // empty for "delete"
 }
@@ -92,6 +92,13 @@ func (l *Log) Len() int {
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	return len(l.entries)
+}
+
+// Reset clears all entries while retaining the allocated capacity.
+func (l *Log) Reset() {
+	l.mu.Lock()
+	l.entries = l.entries[:0]
+	l.mu.Unlock()
 }
 
 // OldestVersion returns the Version of the oldest entry in the log, or 0 if empty.

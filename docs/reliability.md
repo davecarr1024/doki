@@ -102,15 +102,17 @@ doki_heartbeat_received_total{node_id}  # Counter
 **Node metrics:**
 
 ```
-doki_replica_version{shard_id,role}          # Gauge: current version
-doki_replica_term{shard_id,role}             # Gauge: current term
-doki_writes_total{shard_id,result}           # Counter: result=ok|quorum_unavail|not_leader
+doki_replica_version{shard_id,node_id}          # Gauge: current version
+doki_replica_term{shard_id,node_id}             # Gauge: current term
+doki_replica_is_leader{shard_id,node_id}        # Gauge: leader flag
+doki_writes_total{shard_id,result}              # Counter: result=ok|quorum_unavailable|not_leader
 doki_write_duration_seconds{shard_id}        # Histogram
 doki_replications_total{shard_id,result}     # Counter: follower replication ops
 doki_elections_total{shard_id,result}        # Counter: result=won|lost
 doki_leader_heartbeats_sent_total{shard_id}  # Counter: outgoing leader heartbeats
 doki_leader_heartbeats_missed_total{shard_id} # Counter: heartbeats that timed out
-doki_recoveries_total{shard_id,type}         # Counter: type=incremental|snapshot
+doki_recoveries_total{shard_id,recovery_type}   # Counter: type=incremental|snapshot
+doki_last_leader_contact_seconds{shard_id,node_id} # Gauge: age of last leader contact
 ```
 
 **Implementation note:** Use a global `prometheus.Registry` per process,
@@ -124,7 +126,7 @@ Prometheus registry:
 
 ```go
 // After a scenario: assert no write errors occurred
-assert.Equal(t, 0.0, metricValue(nodeReg, "doki_writes_total", Labels{"result":"quorum_unavail"}))
+assert.Equal(t, 0.0, metricValue(nodeReg, "doki_writes_total", Labels{"result":"quorum_unavailable"}))
 
 // Assert split-brain never occurred
 assertNoSplitBrain(t, cluster)

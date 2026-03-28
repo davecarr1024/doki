@@ -341,15 +341,11 @@ sequenceDiagram
         L->>F1: Replicate(term, version, Put(key,value))
         L->>F2: Replicate(term, version, Put(key,value))
     end
-    F1->>F1: check term ≥ my term<br/>stage pending entry
+    F1->>F1: check term ≥ my term<br/>apply entry
     F1-->>L: ACK
-    F2->>F2: check term ≥ my term<br/>stage pending entry
+    F2->>F2: check term ≥ my term<br/>apply entry
     F2-->>L: ACK
-    note over L: quorum reached<br/>commit locally
-    L->>F1: Commit(term, version)
-    L->>F2: Commit(term, version)
-    F1->>F1: apply pending entry<br/>update version
-    F2->>F2: apply pending entry<br/>update version
+    note over L: quorum reached<br/>apply locally
     L-->>C: OK
 ```
 
@@ -366,11 +362,11 @@ For a shard with `n` replicas, quorum requires `floor(n/2) + 1` acknowledgments,
 
 > **Decision:** n=3 is the standard configuration. This tolerates 1 failure, which is the practical minimum for useful fault tolerance without excessive complexity.
 
-### Commit Semantics
+### Replication Semantics
 
-- Followers **stage** replicated entries without applying them.
-- After quorum, the leader **commits** the entry locally and sends a commit message.
-- Followers apply only committed entries, ensuring no follower applies a write the client considers failed.
+- Followers **apply** replicated entries immediately upon receipt.
+- The leader waits for a quorum of follower **apply ACKs**, then applies locally and returns `OK`.
+- Followers that receive out-of-order versions mark themselves not-ready and recover from the leader.
 
 ### Write Timeout and Retry
 
@@ -380,7 +376,7 @@ The leader waits for quorum with a configurable timeout (default: 1 second). If 
 - The client receives a `QUORUM_UNAVAILABLE` error
 - The client may retry
 
-The leader does not retry the write itself. It is the client's responsibility to retry idempotently (e.g., using application-level idempotency keys if needed).
+The leader does not retry the write itself. It is the client's responsibility to retry idempotently (e.g., using application-level idempotency keys if needed). When a quorum attempt fails after some followers have applied, the leader triggers forced recovery on those followers so their state is rolled back to the leader's committed state.
 
 ---
 
@@ -872,7 +868,7 @@ Questions resolved by prior phases are marked ✅. Remaining open questions are 
 
 **Q: Should followers stage (buffer) writes before applying, or apply immediately?**
 
-> ✅ **Resolved (Phase 2):** Stage first, then commit. Followers buffer replicated entries and only apply them after the leader reaches quorum and sends a commit message.
+> ✅ **Resolved (Phase 2):** Apply immediately on replicate. The leader waits for a quorum of apply ACKs, then applies locally and returns success. Followers with gaps mark themselves not-ready and recover from the leader.
 
 **Q: How to handle version conflicts if a stale follower receives a write with a skipped version?**
 

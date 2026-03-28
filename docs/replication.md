@@ -10,9 +10,9 @@ Doki uses **synchronous quorum replication**:
 
 - The leader receives a write from a client
 - The leader replicates to all followers in parallel
-- The write is committed when a quorum (majority) of replicas acknowledge
+- Followers apply the write immediately and ACK
+- The write is committed when a quorum (majority) of replicas acknowledge **apply**
 - The leader applies the write locally and returns success to the client
-- The leader sends a commit message so followers apply the write
 
 This design is simple, correct, and easy to reason about. It sacrifices throughput for clarity.
 
@@ -50,18 +50,14 @@ sequenceDiagram
         A->>C: Replicate(term=7, version=143, Put("x","hello"))
     end
 
-    B->>B: stage pending Put("x","hello")
+    B->>B: apply Put("x","hello")
     B-->>A: ACK(success=true, term=7)
 
-    C->>C: stage pending Put("x","hello")
+    C->>C: apply Put("x","hello")
     C-->>A: ACK(success=true, term=7)
 
     note over A: quorum reached (A+B or A+C)
-    A->>A: commit Put("x","hello"), version=143
-    A->>B: Commit(term=7, version=143)
-    A->>C: Commit(term=7, version=143)
-    B->>B: apply pending Put("x","hello"), version=143
-    C->>C: apply pending Put("x","hello"), version=143
+    A->>A: apply Put("x","hello"), version=143
     A-->>CL: OK
 ```
 
@@ -86,8 +82,7 @@ sequenceDiagram
 
     note over A,C: C timeout — but quorum already reached (A+B)
 
-    A->>A: commit locally
-    A->>B: Commit
+    A->>A: apply locally
     A-->>CL: OK
 
     note over C: C recovers via incremental log or full snapshot (Phase 3)
@@ -111,6 +106,7 @@ sequenceDiagram
     note over A: timeout — no ACKs received<br/>quorum not reached (need 2, got 1)
 
     A-->>CL: QUORUM_UNAVAILABLE
+    note over A: force recover followers that applied
 ```
 
 ---
@@ -119,9 +115,9 @@ sequenceDiagram
 
 Before replicating, the leader verifies:
 
-1. It is still the current leader (`role == LEADER`, `term` matches coordinator's assignment)
+1. It is still the current leader (`role == LEADER`)
 2. The shard is ready (`is_ready == true`)
-3. It has recently heard from at least `quorum - 1` followers (fast-fail if quorum is clearly unavailable)
+3. It has recently heard from enough followers to form a quorum (fast-fail if quorum is clearly unavailable)
 
 If any check fails, the leader returns an error immediately without attempting replication.
 
@@ -141,6 +137,9 @@ quorum = floor(n/2) + 1
 | 5 | 3 | 2 |
 
 The leader counts itself as an implicit ACK. It only needs `quorum - 1` follower ACKs.
+Followers marked `not_ready` are excluded from quorum eligibility.
+In practice, the leader treats peers as eligible if they have responded recently to
+leader heartbeats or replication requests.
 
 ---
 
@@ -213,13 +212,10 @@ Every replication message carries the sender's term. If `response.term > request
 flowchart TD
     A{Receive ReplicateRequest} --> B{version == local_version + 1?}
     B -- yes --> C[Apply, ACK]
-    B -- no --> D{Gap too large?}
-    D -- yes --> E[Trigger recovery]
-    D -- no --> E
-    E --> F[Request snapshot from leader]
-    F --> G[Apply snapshot]
-    G --> H[Mark is_ready=true]
-    H --> I[Apply any buffered writes\nwith version > snapshot.version]
+    B -- no --> D[Mark not-ready]
+    D --> E[Request recovery from leader]
+    E --> F[Apply snapshot or log entries]
+    F --> G[Mark is_ready=true]
 ```
 
 ### Recovery Protocol (Phase 3: Incremental Log)
@@ -248,9 +244,8 @@ sequenceDiagram
 
     note over L: future writes replicate normally
     L->>R: Replicate(v=145, ...)
-    R-->>L: ACK (staged)
-    L->>R: Commit(v=145)
-    R->>R: apply pending v=145
+    R->>R: apply v=145
+    R-->>L: ACK (applied)
 ```
 
 **Log size default:** 1000 entries (configurable via `replication_log_size` in node config).
@@ -277,9 +272,9 @@ The follower accumulates chunks until `is_last = true`, then atomically applies 
 
 ## Divergence Handling
 
-With the append/commit protocol, followers only apply committed entries. This prevents
-followers from applying writes that never reached quorum. Any missing commits are
-repaired via incremental recovery or full snapshot on the next recovery cycle.
+Followers apply entries immediately, but they only keep state that matches the
+leader's committed history. If a quorum attempt fails after some followers apply,
+the leader forces those followers to recover from its committed snapshot.
 
 ---
 
@@ -291,10 +286,9 @@ stateDiagram-v2
 
     NOT_READY --> READY : snapshot applied from leader
 
-    READY --> READY : Replicate(v = local_v+1) → stage + ACK
-    READY --> READY : Commit(v = local_v+1) → apply
+    READY --> READY : Replicate(v = local_v+1) → apply + ACK
 
-    READY --> NOT_READY : version gap detected\nOR lag > max_lag_versions
+    READY --> NOT_READY : version gap detected\nOR forced recovery
 
     NOT_READY --> NOT_READY : awaiting snapshot chunks
 ```

@@ -218,13 +218,17 @@ Key metrics:
 
 | Metric | Labels | Description |
 |--------|--------|-------------|
-| `doki_writes_total` | `shard`, `result` | Total write operations (ok/error) |
-| `doki_reads_total` | `shard`, `result` | Total read operations |
-| `doki_replication_lag_versions` | `shard`, `peer` | Current replication lag per follower |
-| `doki_leader_changes_total` | `shard` | Number of leader changes |
-| `doki_recoveries_total` | `shard`, `type` | Recovery events (incremental/snapshot) |
-| `doki_elections_total` | `shard` | Election attempts triggered |
-| `doki_quorum_failures_total` | `shard` | Writes rejected due to quorum unavailable |
+| `doki_replica_version` | `shard_id`, `node_id` | Current committed version per replica |
+| `doki_replica_term` | `shard_id`, `node_id` | Current term per replica |
+| `doki_replica_is_leader` | `shard_id`, `node_id` | 1 if the replica is leader |
+| `doki_writes_total` | `shard_id`, `result` | Total write operations by result |
+| `doki_write_duration_seconds` | `shard_id` | Leader write latency |
+| `doki_replications_total` | `shard_id`, `result` | Incoming replication results |
+| `doki_elections_total` | `shard_id`, `result` | Election results |
+| `doki_leader_heartbeats_sent_total` | `shard_id` | Outbound leader heartbeats |
+| `doki_leader_heartbeats_missed_total` | `shard_id` | Heartbeats with no peer response |
+| `doki_recoveries_total` | `shard_id`, `recovery_type` | Recovery events (incremental/snapshot) |
+| `doki_last_leader_contact_seconds` | `shard_id`, `node_id` | Age of last leader contact |
 
 Scrape all nodes in your Prometheus config:
 

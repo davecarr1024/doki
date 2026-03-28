@@ -358,10 +358,10 @@ func (s *Server) runLeaderHeartbeat(ctx context.Context, replica *ReplicaState) 
 			}
 
 			s.mu.RLock()
-			peerAddrs := make([]string, 0, len(peers))
+			peerAddrs := make(map[string]string, len(peers))
 			for _, peerID := range peers {
 				if addr, ok := s.nodeAddresses[peerID]; ok {
-					peerAddrs = append(peerAddrs, addr)
+					peerAddrs[peerID] = addr
 				}
 			}
 			s.mu.RUnlock()
@@ -372,7 +372,8 @@ func (s *Server) runLeaderHeartbeat(ctx context.Context, replica *ReplicaState) 
 				LeaderID: nodeID,
 				ShardID:  shardID,
 			}
-			for _, addr := range peerAddrs {
+			for peerID, addr := range peerAddrs {
+				peerID := peerID
 				addr := addr
 				go func() {
 					s.m.LeaderHeartbeatsSentTotal.WithLabelValues(shardID).Inc()
@@ -391,6 +392,10 @@ func (s *Server) runLeaderHeartbeat(ctx context.Context, replica *ReplicaState) 
 							log.Printf("leader heartbeat: higher term shard_id=%s stepping down term=%d",
 								shardID, peerTerm)
 						}
+						replica.mu.Unlock()
+					} else {
+						replica.mu.Lock()
+						replica.PeerLastContact[peerID] = s.clock.Now()
 						replica.mu.Unlock()
 					}
 				}()

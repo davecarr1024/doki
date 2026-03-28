@@ -160,6 +160,23 @@ func (ds *diskState) takeSnapshot(term, version uint64, kvSnapshot map[string]st
 	return nil
 }
 
+// resetSnapshot overwrites the on-disk snapshot with the provided state and
+// truncates the WAL. Used after network recovery to align disk state with leader.
+func (ds *diskState) resetSnapshot(term, version uint64, kvSnapshot map[string]string) error {
+	snap := snapshot.Snapshot{Term: term, Version: version, KV: kvSnapshot}
+	if err := snapshot.Save(ds.snapshotPath, snap); err != nil {
+		return fmt.Errorf("save snapshot: %w", err)
+	}
+	if err := ds.walFile.Truncate(); err != nil {
+		return fmt.Errorf("truncate wal after reset: %w", err)
+	}
+	ds.mu.Lock()
+	ds.writesSinceSnapshot = 0
+	ds.mu.Unlock()
+	log.Printf("diskstate: snapshot reset path=%s version=%d", ds.snapshotPath, version)
+	return nil
+}
+
 // close closes the underlying WAL file.
 func (ds *diskState) close() error {
 	return ds.walFile.Close()

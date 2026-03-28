@@ -51,13 +51,6 @@ type ReplicaState struct {
 	// Incremented on each committed write. Used to compare replica freshness.
 	Version uint64
 
-	// LastLogVersion is the highest log version observed (committed or pending).
-	// It advances on append and commit, and never moves backward.
-	LastLogVersion uint64
-
-	// Pending holds uncommitted log entries by version.
-	Pending map[uint64]replicationlog.Entry
-
 	// IsReady is false while the replica is recovering (pulling a snapshot).
 	// Not-ready replicas do not count toward quorum.
 	IsReady bool
@@ -89,6 +82,10 @@ type ReplicaState struct {
 	// A new election is triggered when (now - LastLeaderContact) > ElectionTimeout.
 	ElectionTimeout time.Duration
 
+	// PeerLastContact tracks the most recent successful contact time for each peer.
+	// Used by the leader to fast-fail writes when quorum is clearly unavailable.
+	PeerLastContact map[string]time.Time
+
 	// Phase 5: bootstrap state for shard splits.
 	// When BootstrapShardID is non-empty, the recovery loop fetches data from
 	// BootstrapShardID (a different shard) rather than this replica's own shard.
@@ -98,10 +95,10 @@ type ReplicaState struct {
 	BootstrapLeaderAddr string
 
 	// Counters accessed atomically (no lock needed).
-	ElectionCount  atomic.Int64
-	RecoveryCount  atomic.Int64
-	WriteOpsTotal  atomic.Int64
-	WriteErrTotal  atomic.Int64
+	ElectionCount atomic.Int64
+	RecoveryCount atomic.Int64
+	WriteOpsTotal atomic.Int64
+	WriteErrTotal atomic.Int64
 }
 
 // NewReplicaState creates a new replica in FOLLOWER state, not ready.
@@ -118,8 +115,8 @@ func NewReplicaState(shardID, nodeID string, peers []string, logSize int, electi
 		Peers:           peers,
 		KV:              memory.New(),
 		RepLog:          replicationlog.New(logSize),
-		Pending:         make(map[uint64]replicationlog.Entry),
 		ElectionTimeout: electionTimeout,
+		PeerLastContact: make(map[string]time.Time, len(peers)),
 	}
 }
 

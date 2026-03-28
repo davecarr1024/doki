@@ -90,7 +90,7 @@ doki/
 
 ## Component Interfaces
 
-### Coordinator → Node (Phase 1+, gRPC)
+### Coordinator → Node (Phase 1+, HTTP/JSON)
 
 ```mermaid
 sequenceDiagram
@@ -104,7 +104,7 @@ sequenceDiagram
     N-->>C: OK
 ```
 
-### Node → Coordinator (HTTP, Phase 0; gRPC, Phase 1+)
+### Node → Coordinator (HTTP/JSON)
 
 ```mermaid
 sequenceDiagram
