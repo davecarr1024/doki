@@ -4,7 +4,7 @@ package doki.node.v1;
 
 import "doki/common/v1/common.proto";
 
-option go_package = "github.com/davecarr1024/doki/gen/proto/node/v1;nodev1";
+option go_package = "github.com/davecarr1024/doki/gen/doki/node/v1;nodev1";
 
 // NodeService is the data-plane API.
 //
@@ -28,6 +28,12 @@ service NodeService {
   // Replicate sends a single write operation from leader to follower.
   // The follower applies it and returns an ACK.
   rpc Replicate(ReplicateRequest) returns (ReplicateResponse);
+
+  // Recover fetches missing entries or a full snapshot from the leader.
+  rpc Recover(RecoverRequest) returns (RecoverResponse);
+
+  // ForceRecover marks a replica not-ready so it re-enters recovery.
+  rpc ForceRecover(ForceRecoverRequest) returns (ForceRecoverResponse);
 
   // SyncState streams a full-state snapshot from leader to a recovering follower.
   rpc SyncState(SyncStateRequest) returns (stream SyncStateResponse);
@@ -118,6 +124,38 @@ message ReplicateResponse {
   bool success = 1;
   uint64 term = 2;  // follower's current term; if > request.term, sender is stale
 }
+
+// --- Recover (incremental or snapshot) ---
+
+message LogEntry {
+  uint64 term = 1;
+  uint64 version = 2;
+  doki.common.v1.Operation op = 3;
+}
+
+message RecoverRequest {
+  string shard_id = 1;
+  uint64 since_version = 2;
+}
+
+message RecoverResponse {
+  enum Type {
+    TYPE_UNSPECIFIED = 0;
+    TYPE_ENTRIES = 1;
+    TYPE_SNAPSHOT = 2;
+  }
+  Type type = 1;
+  uint64 version = 2;
+  repeated LogEntry entries = 3;
+  uint64 term = 4;
+  repeated doki.common.v1.KVEntry kv = 5;
+}
+
+message ForceRecoverRequest {
+  string shard_id = 1;
+}
+
+message ForceRecoverResponse {}
 
 // --- SyncState (snapshot recovery) ---
 

@@ -2,7 +2,7 @@ syntax = "proto3";
 
 package doki.common.v1;
 
-option go_package = "github.com/davecarr1024/doki/gen/proto/common/v1;commonv1";
+option go_package = "github.com/davecarr1024/doki/gen/doki/common/v1;commonv1";
 
 // Operation represents a single write operation applied to a shard's KV store.
 message Operation {

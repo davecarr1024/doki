@@ -45,3 +45,34 @@
 - Add explicit tests for force-recover rollback in quorum-failure scenarios.
 - Expose liveness window as a config knob instead of deriving from heartbeat interval.
 - Consider per-peer readiness reporting from followers for more precise quorum eligibility.
+
+---
+
+# Doki Cleanup Plan — RPC Migration (gRPC)
+
+## Current State
+- **HTTP/JSON** endpoints are still the primary RPC surface for coordinator and node.
+- `proto/doki/*` defines gRPC APIs but no generated code is checked in.
+- Node-to-node replication and node-to-coordinator heartbeats use HTTP.
+- Integration tests exercise HTTP endpoints.
+- HTTP is still used for `/metrics` and `/ready`.
+
+## Plan (To Execute)
+1. **Proto + Codegen**
+   - Extend node/coordinator protos to cover current runtime needs (incremental recovery + leader notification).
+   - Generate gRPC code into `gen/` with Buf.
+   - Verify `~/.local/go/bin/go test ./...`.
+
+2. **gRPC Servers + Clients**
+   - Add gRPC servers for coordinator and node.
+   - Replace node → coordinator calls with gRPC (heartbeat, shard map, leader notify, status, leader lookup).
+   - Replace node → node replication + recovery with gRPC.
+   - Keep HTTP **only** for `/metrics`, `/ready`, and admin endpoints.
+   - Use cmux to serve gRPC + HTTP on the same address (no config change).
+   - Verify `~/.local/go/bin/go test ./...`.
+
+3. **Test Migration**
+   - Update unit tests to exercise gRPC for replication and status calls where appropriate.
+   - Update integration tests to use gRPC for KV operations and status, while preserving `/ready` HTTP.
+   - Add integration coverage for gRPC replication/recovery paths.
+   - Verify `~/.local/go/bin/go test ./...` and `~/.local/go/bin/go test ./test/integration/... -tags=integration`.
