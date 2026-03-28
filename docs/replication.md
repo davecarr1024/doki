@@ -11,7 +11,8 @@ Doki uses **synchronous quorum replication**:
 - The leader receives a write from a client
 - The leader replicates to all followers in parallel
 - The write is committed when a quorum (majority) of replicas acknowledge
-- The leader then applies the write locally and returns success to the client
+- The leader applies the write locally and returns success to the client
+- The leader sends a commit message so followers apply the write
 
 This design is simple, correct, and easy to reason about. It sacrifices throughput for clarity.
 
@@ -49,14 +50,18 @@ sequenceDiagram
         A->>C: Replicate(term=7, version=143, Put("x","hello"))
     end
 
-    B->>B: apply Put("x","hello"), version=143
+    B->>B: stage pending Put("x","hello")
     B-->>A: ACK(success=true, term=7)
 
-    C->>C: apply Put("x","hello"), version=143
+    C->>C: stage pending Put("x","hello")
     C-->>A: ACK(success=true, term=7)
 
     note over A: quorum reached (A+B or A+C)
-    A->>A: apply Put("x","hello"), version=143
+    A->>A: commit Put("x","hello"), version=143
+    A->>B: Commit(term=7, version=143)
+    A->>C: Commit(term=7, version=143)
+    B->>B: apply pending Put("x","hello"), version=143
+    C->>C: apply pending Put("x","hello"), version=143
     A-->>CL: OK
 ```
 
@@ -81,7 +86,8 @@ sequenceDiagram
 
     note over A,C: C timeout — but quorum already reached (A+B)
 
-    A->>A: apply locally
+    A->>A: commit locally
+    A->>B: Commit
     A-->>CL: OK
 
     note over C: C recovers via incremental log or full snapshot (Phase 3)
@@ -242,7 +248,9 @@ sequenceDiagram
 
     note over L: future writes replicate normally
     L->>R: Replicate(v=145, ...)
-    R-->>L: ACK
+    R-->>L: ACK (staged)
+    L->>R: Commit(v=145)
+    R->>R: apply pending v=145
 ```
 
 **Log size default:** 1000 entries (configurable via `replication_log_size` in node config).
@@ -269,37 +277,9 @@ The follower accumulates chunks until `is_last = true`, then atomically applies 
 
 ## Divergence Handling
 
-### The Problem
-
-Without a two-phase commit, a follower may apply a write that the leader never commits:
-
-```mermaid
-sequenceDiagram
-    participant L as Leader (A, v=142)
-    participant B as Follower B
-    participant C as Follower C
-
-    L->>B: Replicate(v=143)
-    B->>B: apply v=143
-    B-->>L: ACK
-
-    note over L: crashes before C ACKs<br/>v=143 never committed
-
-    note over C: new leader elected (C, v=142)
-    C->>B: SyncState
-    note over B: B has v=143 but C only has v=142<br/>B overwrites with C's snapshot
-    C-->>B: Snapshot{v=142}
-    B->>B: apply snapshot → v=142
-```
-
-### v1 Mitigation
-
-- The new leader immediately syncs all followers after election
-- Followers with a higher version than the new leader pull the new leader's snapshot
-- The diverged write (v=143) is lost — but it was never acknowledged to the client as `OK`
-- Clients that received `QUORUM_UNAVAILABLE` or no response for that write must retry
-
-This is the key simplification in v1. The proper solution is a replication log (Phase 3).
+With the append/commit protocol, followers only apply committed entries. This prevents
+followers from applying writes that never reached quorum. Any missing commits are
+repaired via incremental recovery or full snapshot on the next recovery cycle.
 
 ---
 
@@ -311,7 +291,8 @@ stateDiagram-v2
 
     NOT_READY --> READY : snapshot applied from leader
 
-    READY --> READY : Replicate(v = local_v+1) → apply + ACK
+    READY --> READY : Replicate(v = local_v+1) → stage + ACK
+    READY --> READY : Commit(v = local_v+1) → apply
 
     READY --> NOT_READY : version gap detected\nOR lag > max_lag_versions
 

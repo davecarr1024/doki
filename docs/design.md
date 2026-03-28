@@ -336,16 +336,20 @@ sequenceDiagram
     participant F2 as Follower 2
 
     C->>L: Put(shard_id, key, value)
-    note over L: 1. check am I still leader?<br/>2. version++<br/>3. build ReplicateRequest
+    note over L: 1. check am I still leader?<br/>2. assign next log version<br/>3. build ReplicateRequest
     par replicate in parallel
         L->>F1: Replicate(term, version, Put(key,value))
         L->>F2: Replicate(term, version, Put(key,value))
     end
-    F1->>F1: check term ≥ my term<br/>apply op<br/>update version
+    F1->>F1: check term ≥ my term<br/>stage pending entry
     F1-->>L: ACK
-    F2->>F2: check term ≥ my term<br/>apply op<br/>update version
+    F2->>F2: check term ≥ my term<br/>stage pending entry
     F2-->>L: ACK
-    note over L: quorum reached<br/>apply locally
+    note over L: quorum reached<br/>commit locally
+    L->>F1: Commit(term, version)
+    L->>F2: Commit(term, version)
+    F1->>F1: apply pending entry<br/>update version
+    F2->>F2: apply pending entry<br/>update version
     L-->>C: OK
 ```
 
@@ -362,15 +366,11 @@ For a shard with `n` replicas, quorum requires `floor(n/2) + 1` acknowledgments,
 
 > **Decision:** n=3 is the standard configuration. This tolerates 1 failure, which is the practical minimum for useful fault tolerance without excessive complexity.
 
-### Simplifications in v1
+### Commit Semantics
 
-- No uncommitted/committed phase — followers apply immediately on receipt
-- No log — state is the canonical truth
-- No rollback — if a follower diverges (e.g., due to a bug), recovery is via full snapshot
-
-These simplifications mean that if a follower applies a write and the leader fails before reaching quorum, the follower may have applied an operation that was never acknowledged to the client. In v1 this is acceptable: clients that received an error should retry.
-
-> **Known Limitation:** Without a proper two-phase commit or log, it is possible for followers to have applied writes the client considers failed. This is addressed in a future evolution phase with a proper replication log.
+- Followers **stage** replicated entries without applying them.
+- After quorum, the leader **commits** the entry locally and sends a commit message.
+- Followers apply only committed entries, ensuring no follower applies a write the client considers failed.
 
 ### Write Timeout and Retry
 
@@ -872,7 +872,7 @@ Questions resolved by prior phases are marked ✅. Remaining open questions are 
 
 **Q: Should followers stage (buffer) writes before applying, or apply immediately?**
 
-> ✅ **Resolved (Phase 1):** Apply immediately. The downside (potential uncommitted state on a follower if the leader fails before quorum) is mitigated by the replication log (Phase 3) and WAL (Phase 2). A proper two-phase commit is future work.
+> ✅ **Resolved (Phase 2):** Stage first, then commit. Followers buffer replicated entries and only apply them after the leader reaches quorum and sends a commit message.
 
 **Q: How to handle version conflicts if a stale follower receives a write with a skipped version?**
 
