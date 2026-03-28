@@ -21,6 +21,9 @@ make down             # docker compose down
 make clean            # remove build artifacts
 ```
 
+**Rule:** Never force commit.
+**Rule:** Never forget to commit each change.
+
 ---
 
 ## Project Structure

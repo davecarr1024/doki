@@ -36,6 +36,9 @@ jobs:
       - name: Integration tests
         run: go test ./test/integration/... -tags=integration -count=1 -timeout=120s -v
 
+      - name: Reliability tests
+        run: go test ./test/reliability/... -count=1 -timeout=300s -v -tags=reliability
+
   lint:
     name: Lint
     runs-on: ubuntu-latest

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+cd "$ROOT_DIR"
+
+if [ -x "$HOME/.local/go/bin/go" ]; then
+  export PATH="$HOME/.local/go/bin:$PATH"
+fi
+
+make test
+make test-int
