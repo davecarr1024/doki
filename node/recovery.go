@@ -83,6 +83,8 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 			replica.RepLog.Append(e)
 		}
 		replica.IsReady = true
+		replica.LastLogVersion = replica.Version
+		clear(replica.Pending)
 		// Clear bootstrap hint now that first recovery succeeded.
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""
@@ -95,6 +97,8 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		replica.Version = recoverResp.Version
 		replica.Term = recoverResp.Term
 		replica.IsReady = true
+		replica.LastLogVersion = replica.Version
+		clear(replica.Pending)
 		// Clear bootstrap hint now that first recovery succeeded.
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""

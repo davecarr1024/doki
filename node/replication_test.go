@@ -149,9 +149,48 @@ func TestFanOutReplicate_Timeout(t *testing.T) {
 	assert.Less(t, elapsed, time.Second, "should return quickly after timeout")
 }
 
-// --- handleReplicate ---
+// --- fanOutCommit ---
 
-func TestHandleReplicate_AppliesWrite(t *testing.T) {
+func TestFanOutCommit_AllAck(t *testing.T) {
+	makeFollower := func() *httptest.Server {
+		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(CommitResponse{Success: true, Term: 1})
+		}))
+	}
+	s1, s2 := makeFollower(), makeFollower()
+	defer s1.Close()
+	defer s2.Close()
+
+	peers := []string{s1.Listener.Addr().String(), s2.Listener.Addr().String()}
+	acks := fanOutCommit(context.Background(), "shard-0", CommitRequest{
+		Term: 1, Version: 2,
+	}, peers, time.Second)
+	assert.Equal(t, 2, acks)
+}
+
+func TestFanOutCommit_PartialAck(t *testing.T) {
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: true, Term: 1})
+	}))
+	defer good.Close()
+	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Error: "missing"})
+	}))
+	defer bad.Close()
+
+	peers := []string{good.Listener.Addr().String(), bad.Listener.Addr().String()}
+	acks := fanOutCommit(context.Background(), "shard-0", CommitRequest{
+		Term: 1, Version: 3,
+	}, peers, time.Second)
+	assert.Equal(t, 1, acks)
+}
+
+// --- handleReplicate / handleCommit ---
+
+func TestHandleReplicate_StagesWrite(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
 	ts := httptest.NewServer(follower.Handler())
 	defer ts.Close()
@@ -167,25 +206,66 @@ func TestHandleReplicate_AppliesWrite(t *testing.T) {
 	assert.True(t, rr.Success)
 
 	val, ok := follower.getKV("shard-0", "hello")
+	assert.False(t, ok, "write should not be applied before commit")
+	assert.Empty(t, val)
+
+	follower.mu.RLock()
+	replica := follower.replicas["shard-0"]
+	follower.mu.RUnlock()
+	require.NotNil(t, replica)
+	replica.mu.RLock()
+	_, pending := replica.Pending[1]
+	replica.mu.RUnlock()
+	assert.True(t, pending, "pending entry should be staged")
+}
+
+func TestHandleCommit_AppliesWrite(t *testing.T) {
+	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
+	ts := httptest.NewServer(follower.Handler())
+	defer ts.Close()
+
+	appendReq := ReplicateRequest{Term: 1, Version: 1, Op: "put", Key: "hello", Value: "world"}
+	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(appendReq))
+	require.NoError(t, err)
+	defer func() { _ = resp.Body.Close() }()
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	commitReq := CommitRequest{Term: 1, Version: 1}
+	commitResp, err := http.Post(ts.URL+"/internal/commit/shard-0", "application/json", jsonBody(commitReq))
+	require.NoError(t, err)
+	defer func() { _ = commitResp.Body.Close() }()
+	require.Equal(t, http.StatusOK, commitResp.StatusCode)
+
+	var cr CommitResponse
+	require.NoError(t, json.NewDecoder(commitResp.Body).Decode(&cr))
+	assert.True(t, cr.Success)
+
+	val, ok := follower.getKV("shard-0", "hello")
 	require.True(t, ok)
 	assert.Equal(t, "world", val)
 }
 
-func TestHandleReplicate_Delete(t *testing.T) {
+func TestHandleCommit_Delete(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
 	follower.setKV("shard-0", "gone", "value")
 	ts := httptest.NewServer(follower.Handler())
 	defer ts.Close()
 
-	req := ReplicateRequest{Term: 1, Version: 2, Op: "delete", Key: "gone"}
-	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
+	appendReq := ReplicateRequest{Term: 1, Version: 1, Op: "delete", Key: "gone"}
+	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(appendReq))
 	require.NoError(t, err)
 	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Equal(t, http.StatusOK, resp.StatusCode)
 
-	var rr ReplicateResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
-	assert.True(t, rr.Success)
+	commitReq := CommitRequest{Term: 1, Version: 1}
+	commitResp, err := http.Post(ts.URL+"/internal/commit/shard-0", "application/json", jsonBody(commitReq))
+	require.NoError(t, err)
+	defer func() { _ = commitResp.Body.Close() }()
+	require.Equal(t, http.StatusOK, commitResp.StatusCode)
+
+	var cr CommitResponse
+	require.NoError(t, json.NewDecoder(commitResp.Body).Decode(&cr))
+	assert.True(t, cr.Success)
 
 	_, ok := follower.getKV("shard-0", "gone")
 	assert.False(t, ok, "key should have been deleted")

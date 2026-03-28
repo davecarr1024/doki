@@ -51,6 +51,13 @@ type ReplicaState struct {
 	// Incremented on each committed write. Used to compare replica freshness.
 	Version uint64
 
+	// LastLogVersion is the highest log version observed (committed or pending).
+	// It advances on append and commit, and never moves backward.
+	LastLogVersion uint64
+
+	// Pending holds uncommitted log entries by version.
+	Pending map[uint64]replicationlog.Entry
+
 	// IsReady is false while the replica is recovering (pulling a snapshot).
 	// Not-ready replicas do not count toward quorum.
 	IsReady bool
@@ -111,6 +118,7 @@ func NewReplicaState(shardID, nodeID string, peers []string, logSize int, electi
 		Peers:           peers,
 		KV:              memory.New(),
 		RepLog:          replicationlog.New(logSize),
+		Pending:         make(map[uint64]replicationlog.Entry),
 		ElectionTimeout: electionTimeout,
 	}
 }

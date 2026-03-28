@@ -29,7 +29,8 @@ import (
 //
 // Phase 1 endpoints:
 //   - POST /kv/{shard_id}                  — KV operations (put/get/delete); leader only
-//   - POST /internal/replicate/{shard_id}  — replication fan-out from leader
+//   - POST /internal/replicate/{shard_id}  — append pending replication entry
+//   - POST /internal/commit/{shard_id}     — commit replication entry
 //   - GET  /internal/sync/{shard_id}       — full-state sync for recovering followers
 //
 // Phase 2 additions:
@@ -178,6 +179,7 @@ func (s *Server) initShardLocked(shard shardmap.ShardInfo, resp coordinator.Shar
 			} else if loaded.Valid {
 				r.KV.ApplySnapshot(loaded.KV)
 				r.Version = loaded.Version
+				r.LastLogVersion = loaded.Version
 				r.Term = loaded.Term
 				r.IsReady = true // disk state means we don't need network recovery
 				r.BootstrapShardID = ""
@@ -384,6 +386,7 @@ func (s *Server) registerRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /ready", s.handleReady)
 	mux.HandleFunc("POST /kv/{shard_id}", s.handleKV)
 	mux.HandleFunc("POST /internal/replicate/{shard_id}", s.handleReplicate)
+	mux.HandleFunc("POST /internal/commit/{shard_id}", s.handleCommit)
 	mux.HandleFunc("GET /internal/sync/{shard_id}", s.handleSync)
 	mux.HandleFunc("GET /internal/recover/{shard_id}", s.handleRecover)
 	// Phase 4: distributed election endpoints.
@@ -552,48 +555,19 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 
 	replica.mu.Lock()
 	term := replica.Term
-	version := replica.Version + 1
-
-	// Write-Ahead Log: persist to disk before applying in memory.
-	s.mu.RLock()
-	ds := s.diskStates[replica.ShardID]
-	s.mu.RUnlock()
-	if ds != nil {
-		walEntry := walEntryFrom(req.Op, req.Key, req.Value, term, version)
-		if err := ds.appendWAL(walEntry); err != nil {
-			replica.mu.Unlock()
-			return fmt.Errorf("wal append: %w", err)
-		}
-	}
-
-	// Apply locally.
-	switch req.Op {
-	case "put":
-		replica.KV.Put(req.Key, req.Value)
-	case "delete":
-		replica.KV.Delete(req.Key)
-	}
-	replica.Version = version
-	// Append to replication log while still holding the lock so entries
-	// are always recorded in version order.
-	replica.RepLog.Append(replicationlog.Entry{
+	version := replica.LastLogVersion + 1
+	replica.LastLogVersion = version
+	entry := replicationlog.Entry{
 		Term:    term,
 		Version: version,
 		Op:      req.Op,
 		Key:     req.Key,
 		Value:   req.Value,
-	})
+	}
+	replica.Pending[version] = entry
 	// Collect peer addresses while holding the lock.
 	peers := append([]string(nil), replica.Peers...)
 	replica.mu.Unlock()
-
-	// Possibly take a snapshot now that the write is applied.
-	if ds != nil {
-		kv := replica.KV.Snapshot()
-		if err := ds.maybeSnapshot(term, version, kv); err != nil {
-			log.Printf("snapshot failed shard_id=%s err=%v", replica.ShardID, err)
-		}
-	}
 
 	// Determine quorum requirement.
 	// We count the leader as 1; need (quorum-1) follower ACKs.
@@ -604,6 +578,7 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 			peerAddrs = append(peerAddrs, addr)
 		}
 	}
+	ds := s.diskStates[replica.ShardID]
 	s.mu.RUnlock()
 
 	// Total replicas = followers + 1 (leader). Quorum = floor(total/2)+1.
@@ -612,23 +587,86 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	needed := quorum - 1 // leader already counts as 1
 
 	if needed == 0 {
-		// Single-replica shard; no followers needed.
+		// Single-replica shard; commit locally immediately.
+		replica.mu.Lock()
+		if err := applyCommittedEntryLocked(replica, entry, ds); err != nil {
+			replica.mu.Unlock()
+			return fmt.Errorf("commit apply: %w", err)
+		}
+		replica.mu.Unlock()
+		if ds != nil {
+			kv := replica.KV.Snapshot()
+			if err := ds.maybeSnapshot(term, version, kv); err != nil {
+				log.Printf("snapshot failed shard_id=%s err=%v", replica.ShardID, err)
+			}
+		}
+		replica.WriteOpsTotal.Add(1)
 		return nil
 	}
 
 	replReq := ReplicateRequest{
 		Term:    term,
-		Version: version,
-		Op:      req.Op,
-		Key:     req.Key,
-		Value:   req.Value,
+		Version: entry.Version,
+		Op:      entry.Op,
+		Key:     entry.Key,
+		Value:   entry.Value,
 	}
 	acks := fanOutReplicate(ctx, replica.ShardID, replReq, peerAddrs, s.cfg.QuorumTimeout)
 	if acks < needed {
+		replica.mu.Lock()
+		delete(replica.Pending, entry.Version)
+		replica.mu.Unlock()
 		replica.WriteErrTotal.Add(1)
 		return fmt.Errorf("quorum unavailable: got %d/%d follower ACKs", acks, needed)
 	}
+
+	replica.mu.Lock()
+	if err := applyCommittedEntryLocked(replica, entry, ds); err != nil {
+		replica.mu.Unlock()
+		return fmt.Errorf("commit apply: %w", err)
+	}
+	replica.mu.Unlock()
+
+	if ds != nil {
+		kv := replica.KV.Snapshot()
+		if err := ds.maybeSnapshot(term, version, kv); err != nil {
+			log.Printf("snapshot failed shard_id=%s err=%v", replica.ShardID, err)
+		}
+	}
+
+	commitReq := CommitRequest{Term: term, Version: entry.Version}
+	_ = fanOutCommit(ctx, replica.ShardID, commitReq, peerAddrs, s.cfg.QuorumTimeout)
+
 	replica.WriteOpsTotal.Add(1)
+	return nil
+}
+
+func applyCommittedEntryLocked(replica *ReplicaState, entry replicationlog.Entry, ds *diskState) error {
+	if ds != nil {
+		walEntry := walEntryFrom(entry.Op, entry.Key, entry.Value, entry.Term, entry.Version)
+		if err := ds.appendWAL(walEntry); err != nil {
+			return fmt.Errorf("wal append: %w", err)
+		}
+	}
+
+	switch entry.Op {
+	case "put":
+		replica.KV.Put(entry.Key, entry.Value)
+	case "delete":
+		replica.KV.Delete(entry.Key)
+	}
+	if entry.Version > replica.Version {
+		replica.Version = entry.Version
+	}
+	if entry.Term > replica.Term {
+		replica.Term = entry.Term
+	}
+	replica.RepLog.Append(entry)
+	if entry.Version > replica.LastLogVersion {
+		replica.LastLogVersion = entry.Version
+	}
+	delete(replica.Pending, entry.Version)
+	replica.IsReady = true
 	return nil
 }
 
@@ -666,25 +704,16 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Write-Ahead Log: persist before applying.
-	s.mu.RLock()
-	ds := s.diskStates[shardID]
-	s.mu.RUnlock()
-	if ds != nil {
-		walEntry := walEntryFrom(req.Op, req.Key, req.Value, req.Term, req.Version)
-		if err := ds.appendWAL(walEntry); err != nil {
-			replica.mu.Unlock()
-			s.m.ReplicationsTotal.WithLabelValues(shardID, "wal_error").Inc()
-			log.Printf("follower wal append failed shard_id=%s err=%v", shardID, err)
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusInternalServerError)
-			_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Error: "wal error"})
-			return
+	if req.Term > replica.Term {
+		replica.Term = req.Term
+		for v, e := range replica.Pending {
+			if e.Term < req.Term {
+				delete(replica.Pending, v)
+			}
 		}
 	}
 
-	// Ignore duplicates: if we already have this version (e.g. received via
-	// incremental recovery and replication concurrently), skip silently.
+	// Ignore duplicates: if we already have this version committed, skip silently.
 	if req.Version <= replica.Version {
 		term := replica.Term
 		replica.mu.Unlock()
@@ -694,43 +723,130 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Apply the write.
-	switch req.Op {
-	case "put":
-		replica.KV.Put(req.Key, req.Value)
-	case "delete":
-		replica.KV.Delete(req.Key)
+	if _, ok := replica.Pending[req.Version]; ok {
+		term := replica.Term
+		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "duplicate").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: term})
+		return
 	}
-	replica.Version = req.Version
-	if req.Term > replica.Term {
-		replica.Term = req.Term
-	}
-	replica.IsReady = true // receiving replication means we're in sync
-	// Phase 4: valid replication from leader proves leader is alive; reset election timer.
-	replica.LastLeaderContact = s.clock.Now()
-	// Append to replication log so that if this follower is later promoted to
-	// leader it can serve incremental recovery without having an empty log.
-	replica.RepLog.Append(replicationlog.Entry{
+
+	replica.Pending[req.Version] = replicationlog.Entry{
 		Term:    req.Term,
 		Version: req.Version,
 		Op:      req.Op,
 		Key:     req.Key,
 		Value:   req.Value,
-	})
+	}
+	if req.Version > replica.LastLogVersion {
+		replica.LastLogVersion = req.Version
+	}
+	// Phase 4: valid replication from leader proves leader is alive; reset election timer.
+	replica.LastLeaderContact = s.clock.Now()
 	replica.mu.Unlock()
 
-	// Possibly snapshot after applying.
+	s.m.ReplicationsTotal.WithLabelValues(shardID, "append_ok").Inc()
+	log.Printf("replicated shard_id=%s op=%s key=%s version=%d staged=true", shardID, req.Op, req.Key, req.Version)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: req.Term})
+}
+
+// handleCommit handles POST /internal/commit/{shard_id} from the leader.
+func (s *Server) handleCommit(w http.ResponseWriter, r *http.Request) {
+	shardID := r.PathValue("shard_id")
+
+	s.mu.RLock()
+	replica := s.replicas[shardID]
+	ds := s.diskStates[shardID]
+	s.mu.RUnlock()
+
+	if replica == nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusNotFound)
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Error: "shard not found"})
+		return
+	}
+
+	var req CommitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Error: "bad request"})
+		return
+	}
+
+	replica.mu.Lock()
+	// Reject stale leader.
+	if req.Term < replica.Term {
+		term := replica.Term
+		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "commit_stale_term").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Term: term, Error: "stale term"})
+		return
+	}
+
+	if req.Term > replica.Term {
+		replica.Term = req.Term
+		for v, e := range replica.Pending {
+			if e.Term < req.Term {
+				delete(replica.Pending, v)
+			}
+		}
+	}
+
+	if req.Version <= replica.Version {
+		term := replica.Term
+		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "commit_duplicate").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: true, Term: term})
+		return
+	}
+
+	entry, ok := replica.Pending[req.Version]
+	if !ok {
+		term := replica.Term
+		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "commit_missing").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Term: term, Error: "missing pending entry"})
+		return
+	}
+
+	if req.Version != replica.Version+1 {
+		term := replica.Term
+		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "commit_out_of_order").Inc()
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Term: term, Error: "out of order commit"})
+		return
+	}
+
+	if err := applyCommittedEntryLocked(replica, entry, ds); err != nil {
+		replica.mu.Unlock()
+		s.m.ReplicationsTotal.WithLabelValues(shardID, "commit_wal_error").Inc()
+		log.Printf("commit wal append failed shard_id=%s err=%v", shardID, err)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		_ = json.NewEncoder(w).Encode(CommitResponse{Success: false, Error: "wal error"})
+		return
+	}
+	replica.LastLeaderContact = s.clock.Now()
+	replica.mu.Unlock()
+
 	if ds != nil {
 		kv := replica.KV.Snapshot()
-		if err := ds.maybeSnapshot(req.Term, req.Version, kv); err != nil {
+		if err := ds.maybeSnapshot(entry.Term, entry.Version, kv); err != nil {
 			log.Printf("follower snapshot failed shard_id=%s err=%v", shardID, err)
 		}
 	}
 
-	s.m.ReplicationsTotal.WithLabelValues(shardID, "ok").Inc()
-	log.Printf("replicated shard_id=%s op=%s key=%s version=%d", shardID, req.Op, req.Key, req.Version)
+	s.m.ReplicationsTotal.WithLabelValues(shardID, "commit_ok").Inc()
+	log.Printf("commit applied shard_id=%s op=%s key=%s version=%d", shardID, entry.Op, entry.Key, entry.Version)
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: req.Term})
+	_ = json.NewEncoder(w).Encode(CommitResponse{Success: true, Term: req.Term})
 }
 
 // handleSync handles GET /internal/sync/{shard_id} — full-state snapshot for recovery.
