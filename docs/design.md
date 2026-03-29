@@ -772,6 +772,8 @@ Every node exposes a `/status` endpoint returning:
       "term": 3,
       "version": 142,
       "is_ready": true,
+      "recovery_state": "HEALTHY",
+      "recovery_source": "",
       "peers": ["node-b", "node-c"],
       "peer_versions": {
         "node-b": 141,
@@ -779,6 +781,7 @@ Every node exposes a `/status` endpoint returning:
       }
     }
   ],
+  "shard_map_version": 7,
   "uptime_seconds": 3600
 }
 ```

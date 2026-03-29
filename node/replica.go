@@ -63,6 +63,9 @@ type ReplicaState struct {
 	// Peers is the list of other node IDs that host replicas of this shard.
 	Peers []string
 
+	// ShardMapVersion is the shard map version used to configure this replica.
+	ShardMapVersion uint64
+
 	// KV is the storage engine for this replica.
 	KV storage.Storage
 

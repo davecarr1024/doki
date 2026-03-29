@@ -126,6 +126,7 @@ func (s *Server) InitShards(resp coordinator.ShardMapResponse) {
 	defer s.mu.Unlock()
 	s.nodeAddresses = resp.NodeAddresses
 	s.shardMapVersion = resp.Version
+	log.Printf("shard map initialized version=%d", resp.Version)
 	for _, shard := range resp.Shards {
 		if !shard.HasReplica(s.cfg.Node.ID) {
 			continue
@@ -163,6 +164,7 @@ func (s *Server) initShardLocked(shard shardmap.ShardInfo, resp coordinator.Shar
 		}
 	}
 	r.LeaderID = shard.Leader
+	r.ShardMapVersion = s.shardMapVersion
 
 	// Phase 5: for shard splits, record where to fetch the initial snapshot.
 	if shard.BootstrapSourceShardID != "" {
@@ -434,9 +436,10 @@ func (s *Server) Handler() http.Handler {
 
 // NodeStatusResponse is the full body of GET /status.
 type NodeStatusResponse struct {
-	NodeID        string                  `json:"node_id"`
-	UptimeSeconds float64                 `json:"uptime_seconds"`
-	Shards        []ReplicaStatusSnapshot `json:"shards"`
+	NodeID          string                  `json:"node_id"`
+	UptimeSeconds   float64                 `json:"uptime_seconds"`
+	ShardMapVersion uint64                  `json:"shard_map_version"`
+	Shards          []ReplicaStatusSnapshot `json:"shards"`
 }
 
 func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
@@ -445,12 +448,14 @@ func (s *Server) handleStatus(w http.ResponseWriter, r *http.Request) {
 	for _, rep := range s.replicas {
 		shards = append(shards, rep.StatusSnapshot())
 	}
+	mapVersion := s.shardMapVersion
 	s.mu.RUnlock()
 
 	resp := NodeStatusResponse{
-		NodeID:        s.cfg.Node.ID,
-		UptimeSeconds: s.clock.Now().Sub(s.startedAt).Seconds(),
-		Shards:        shards,
+		NodeID:          s.cfg.Node.ID,
+		UptimeSeconds:   s.clock.Now().Sub(s.startedAt).Seconds(),
+		ShardMapVersion: mapVersion,
+		Shards:          shards,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
@@ -547,6 +552,11 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 	case "put":
 		result, err := s.leaderWrite(r.Context(), replica, req)
 		if err != nil {
+			if errors.Is(err, errShardMapStale) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: "SHARD_MAP_STALE"})
+				return
+			}
 			s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
@@ -558,6 +568,11 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 	case "delete":
 		result, err := s.leaderWrite(r.Context(), replica, req)
 		if err != nil {
+			if errors.Is(err, errShardMapStale) {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: "SHARD_MAP_STALE"})
+				return
+			}
 			s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
@@ -583,6 +598,15 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	now := s.clock.Now()
 	if _, err := ensureLeaderReady(replica); err != nil {
 		return WriteResult{}, err
+	}
+	s.mu.RLock()
+	currentMapVersion := s.shardMapVersion
+	s.mu.RUnlock()
+	replica.mu.RLock()
+	replicaMapVersion := replica.ShardMapVersion
+	replica.mu.RUnlock()
+	if replicaMapVersion != currentMapVersion {
+		return WriteResult{}, errShardMapStale
 	}
 	replica.mu.RLock()
 	term := replica.Term
@@ -995,6 +1019,7 @@ func (s *Server) refetchShardMap() {
 	s.mu.Lock()
 	s.nodeAddresses = smResp.NodeAddresses
 	s.shardMapVersion = smResp.Version
+	log.Printf("shard map updated version=%d", smResp.Version)
 	// Update shard leader index.
 	for _, shard := range smResp.Shards {
 		s.shardLeaders[shard.ID] = shard.Leader
@@ -1053,6 +1078,7 @@ func (s *Server) refetchShardMap() {
 				log.Printf("leader changed shard_id=%s old=%s new=%s", shard.ID, oldLeader, r.LeaderID)
 				r.LastLeaderContact = s.clock.Now()
 			}
+			r.ShardMapVersion = s.shardMapVersion
 			r.mu.Unlock()
 		} else {
 			// Brand-new shard for this node.

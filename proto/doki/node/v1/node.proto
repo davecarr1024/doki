@@ -247,4 +247,5 @@ message GetStatusResponse {
   string node_id = 1;
   double uptime_seconds = 2;
   repeated ShardStatus shards = 3;
+  uint64 shard_map_version = 4;
 }

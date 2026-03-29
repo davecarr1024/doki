@@ -1643,12 +1643,13 @@ func (x *ShardStatus) GetRecoverySource() string {
 }
 
 type GetStatusResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
-	UptimeSeconds float64                `protobuf:"fixed64,2,opt,name=uptime_seconds,json=uptimeSeconds,proto3" json:"uptime_seconds,omitempty"`
-	Shards        []*ShardStatus         `protobuf:"bytes,3,rep,name=shards,proto3" json:"shards,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	NodeId          string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
+	UptimeSeconds   float64                `protobuf:"fixed64,2,opt,name=uptime_seconds,json=uptimeSeconds,proto3" json:"uptime_seconds,omitempty"`
+	Shards          []*ShardStatus         `protobuf:"bytes,3,rep,name=shards,proto3" json:"shards,omitempty"`
+	ShardMapVersion uint64                 `protobuf:"varint,4,opt,name=shard_map_version,json=shardMapVersion,proto3" json:"shard_map_version,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *GetStatusResponse) Reset() {
@@ -1700,6 +1701,13 @@ func (x *GetStatusResponse) GetShards() []*ShardStatus {
 		return x.Shards
 	}
 	return nil
+}
+
+func (x *GetStatusResponse) GetShardMapVersion() uint64 {
+	if x != nil {
+		return x.ShardMapVersion
+	}
+	return 0
 }
 
 var File_doki_node_v1_node_proto protoreflect.FileDescriptor
@@ -1825,11 +1833,12 @@ const file_doki_node_v1_node_proto_rawDesc = "" +
 	"\x0frecovery_source\x18\t \x01(\tR\x0erecoverySource\x1a?\n" +
 	"\x11PeerVersionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
-	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\x86\x01\n" +
+	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\xb2\x01\n" +
 	"\x11GetStatusResponse\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12%\n" +
 	"\x0euptime_seconds\x18\x02 \x01(\x01R\ruptimeSeconds\x121\n" +
-	"\x06shards\x18\x03 \x03(\v2\x19.doki.node.v1.ShardStatusR\x06shards2\xa6\a\n" +
+	"\x06shards\x18\x03 \x03(\v2\x19.doki.node.v1.ShardStatusR\x06shards\x12*\n" +
+	"\x11shard_map_version\x18\x04 \x01(\x04R\x0fshardMapVersion2\xa6\a\n" +
 	"\vNodeService\x12:\n" +
 	"\x03Put\x12\x18.doki.node.v1.PutRequest\x1a\x19.doki.node.v1.PutResponse\x12:\n" +
 	"\x03Get\x12\x18.doki.node.v1.GetRequest\x1a\x19.doki.node.v1.GetResponse\x12C\n" +

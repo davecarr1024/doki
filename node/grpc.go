@@ -276,12 +276,14 @@ func (g *grpcServer) GetStatus(ctx context.Context, req *nodev1.GetStatusRequest
 	}
 	nodeID := g.s.cfg.Node.ID
 	uptime := g.s.clock.Now().Sub(g.s.startedAt).Seconds()
+	shardMapVersion := g.s.shardMapVersion
 	g.s.mu.RUnlock()
 
 	return &nodev1.GetStatusResponse{
-		NodeId:        nodeID,
-		UptimeSeconds: uptime,
-		Shards:        shards,
+		NodeId:          nodeID,
+		UptimeSeconds:   uptime,
+		Shards:          shards,
+		ShardMapVersion: shardMapVersion,
 	}, nil
 }
 
@@ -306,6 +308,9 @@ func (g *grpcServer) handleWrite(ctx context.Context, shardID, op, key, value st
 	}
 	result, err := g.s.leaderWrite(ctx, replica, KVRequest{Op: op, Key: key, Value: value})
 	if err != nil {
+		if errors.Is(err, errShardMapStale) {
+			return &nodev1.PutResponse{Result: nodev1.PutResponse_RESULT_NOT_READY}, nil
+		}
 		g.s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 		return &nodev1.PutResponse{Result: nodev1.PutResponse_RESULT_QUORUM_UNAVAILABLE}, nil
 	}

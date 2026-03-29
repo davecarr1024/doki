@@ -3,8 +3,9 @@ package node
 import "errors"
 
 var (
-	errNotLeader = errors.New("not leader")
-	errNotReady  = errors.New("not ready")
+	errNotLeader     = errors.New("not leader")
+	errNotReady      = errors.New("not ready")
+	errShardMapStale = errors.New("stale shard map")
 )
 
 func ensureLeaderReady(replica *ReplicaState) (ReplicaStatusSnapshot, error) {
