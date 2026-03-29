@@ -19,16 +19,18 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	NodeService_Put_FullMethodName          = "/doki.node.v1.NodeService/Put"
-	NodeService_Get_FullMethodName          = "/doki.node.v1.NodeService/Get"
-	NodeService_Delete_FullMethodName       = "/doki.node.v1.NodeService/Delete"
-	NodeService_Replicate_FullMethodName    = "/doki.node.v1.NodeService/Replicate"
-	NodeService_Recover_FullMethodName      = "/doki.node.v1.NodeService/Recover"
-	NodeService_ForceRecover_FullMethodName = "/doki.node.v1.NodeService/ForceRecover"
-	NodeService_SyncState_FullMethodName    = "/doki.node.v1.NodeService/SyncState"
-	NodeService_AssignLeader_FullMethodName = "/doki.node.v1.NodeService/AssignLeader"
-	NodeService_SetFollower_FullMethodName  = "/doki.node.v1.NodeService/SetFollower"
-	NodeService_GetStatus_FullMethodName    = "/doki.node.v1.NodeService/GetStatus"
+	NodeService_Put_FullMethodName             = "/doki.node.v1.NodeService/Put"
+	NodeService_Get_FullMethodName             = "/doki.node.v1.NodeService/Get"
+	NodeService_Delete_FullMethodName          = "/doki.node.v1.NodeService/Delete"
+	NodeService_Replicate_FullMethodName       = "/doki.node.v1.NodeService/Replicate"
+	NodeService_Recover_FullMethodName         = "/doki.node.v1.NodeService/Recover"
+	NodeService_ForceRecover_FullMethodName    = "/doki.node.v1.NodeService/ForceRecover"
+	NodeService_RequestVote_FullMethodName     = "/doki.node.v1.NodeService/RequestVote"
+	NodeService_LeaderHeartbeat_FullMethodName = "/doki.node.v1.NodeService/LeaderHeartbeat"
+	NodeService_SyncState_FullMethodName       = "/doki.node.v1.NodeService/SyncState"
+	NodeService_AssignLeader_FullMethodName    = "/doki.node.v1.NodeService/AssignLeader"
+	NodeService_SetFollower_FullMethodName     = "/doki.node.v1.NodeService/SetFollower"
+	NodeService_GetStatus_FullMethodName       = "/doki.node.v1.NodeService/GetStatus"
 )
 
 // NodeServiceClient is the client API for NodeService service.
@@ -54,6 +56,10 @@ type NodeServiceClient interface {
 	Recover(ctx context.Context, in *RecoverRequest, opts ...grpc.CallOption) (*RecoverResponse, error)
 	// ForceRecover marks a replica not-ready so it re-enters recovery.
 	ForceRecover(ctx context.Context, in *ForceRecoverRequest, opts ...grpc.CallOption) (*ForceRecoverResponse, error)
+	// RequestVote asks a peer for a vote in a given term.
+	RequestVote(ctx context.Context, in *VoteRequest, opts ...grpc.CallOption) (*VoteResponse, error)
+	// LeaderHeartbeat informs followers that the leader is alive.
+	LeaderHeartbeat(ctx context.Context, in *LeaderHeartbeatRequest, opts ...grpc.CallOption) (*LeaderHeartbeatResponse, error)
 	// SyncState streams a full-state snapshot from leader to a recovering follower.
 	SyncState(ctx context.Context, in *SyncStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SyncStateResponse], error)
 	// AssignLeader tells a node it is now the leader for a shard.
@@ -132,6 +138,26 @@ func (c *nodeServiceClient) ForceRecover(ctx context.Context, in *ForceRecoverRe
 	return out, nil
 }
 
+func (c *nodeServiceClient) RequestVote(ctx context.Context, in *VoteRequest, opts ...grpc.CallOption) (*VoteResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(VoteResponse)
+	err := c.cc.Invoke(ctx, NodeService_RequestVote_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *nodeServiceClient) LeaderHeartbeat(ctx context.Context, in *LeaderHeartbeatRequest, opts ...grpc.CallOption) (*LeaderHeartbeatResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(LeaderHeartbeatResponse)
+	err := c.cc.Invoke(ctx, NodeService_LeaderHeartbeat_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *nodeServiceClient) SyncState(ctx context.Context, in *SyncStateRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[SyncStateResponse], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	stream, err := c.cc.NewStream(ctx, &NodeService_ServiceDesc.Streams[0], NodeService_SyncState_FullMethodName, cOpts...)
@@ -204,6 +230,10 @@ type NodeServiceServer interface {
 	Recover(context.Context, *RecoverRequest) (*RecoverResponse, error)
 	// ForceRecover marks a replica not-ready so it re-enters recovery.
 	ForceRecover(context.Context, *ForceRecoverRequest) (*ForceRecoverResponse, error)
+	// RequestVote asks a peer for a vote in a given term.
+	RequestVote(context.Context, *VoteRequest) (*VoteResponse, error)
+	// LeaderHeartbeat informs followers that the leader is alive.
+	LeaderHeartbeat(context.Context, *LeaderHeartbeatRequest) (*LeaderHeartbeatResponse, error)
 	// SyncState streams a full-state snapshot from leader to a recovering follower.
 	SyncState(*SyncStateRequest, grpc.ServerStreamingServer[SyncStateResponse]) error
 	// AssignLeader tells a node it is now the leader for a shard.
@@ -238,6 +268,12 @@ func (UnimplementedNodeServiceServer) Recover(context.Context, *RecoverRequest) 
 }
 func (UnimplementedNodeServiceServer) ForceRecover(context.Context, *ForceRecoverRequest) (*ForceRecoverResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ForceRecover not implemented")
+}
+func (UnimplementedNodeServiceServer) RequestVote(context.Context, *VoteRequest) (*VoteResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RequestVote not implemented")
+}
+func (UnimplementedNodeServiceServer) LeaderHeartbeat(context.Context, *LeaderHeartbeatRequest) (*LeaderHeartbeatResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method LeaderHeartbeat not implemented")
 }
 func (UnimplementedNodeServiceServer) SyncState(*SyncStateRequest, grpc.ServerStreamingServer[SyncStateResponse]) error {
 	return status.Error(codes.Unimplemented, "method SyncState not implemented")
@@ -379,6 +415,42 @@ func _NodeService_ForceRecover_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _NodeService_RequestVote_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(VoteRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).RequestVote(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_RequestVote_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).RequestVote(ctx, req.(*VoteRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _NodeService_LeaderHeartbeat_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(LeaderHeartbeatRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(NodeServiceServer).LeaderHeartbeat(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: NodeService_LeaderHeartbeat_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(NodeServiceServer).LeaderHeartbeat(ctx, req.(*LeaderHeartbeatRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _NodeService_SyncState_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(SyncStateRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -474,6 +546,14 @@ var NodeService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ForceRecover",
 			Handler:    _NodeService_ForceRecover_Handler,
+		},
+		{
+			MethodName: "RequestVote",
+			Handler:    _NodeService_RequestVote_Handler,
+		},
+		{
+			MethodName: "LeaderHeartbeat",
+			Handler:    _NodeService_LeaderHeartbeat_Handler,
 		},
 		{
 			MethodName: "AssignLeader",

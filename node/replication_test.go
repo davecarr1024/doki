@@ -2,19 +2,19 @@ package node
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/davecarr1024/doki/coordinator"
+	commonv1 "github.com/davecarr1024/doki/gen/doki/common/v1"
+	nodev1 "github.com/davecarr1024/doki/gen/doki/node/v1"
 	"github.com/davecarr1024/doki/internal/config"
 	"github.com/davecarr1024/doki/internal/replicationlog"
 	"github.com/davecarr1024/doki/internal/shardmap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // --- test helpers ---
@@ -46,11 +46,6 @@ func newTestServer(nodeID, leaderID string, replicas []string) *Server {
 	srv := NewServer(testNodeCfg(nodeID), nil)
 	srv.InitShards(testShardMapResp("shard-0", leaderID, replicas, addrs))
 	return srv
-}
-
-func jsonBody(v any) *strings.Reader {
-	b, _ := json.Marshal(v)
-	return strings.NewReader(string(b))
 }
 
 // getKV reads a key from the named shard's KV store directly (test-only).
@@ -86,6 +81,17 @@ func (s *Server) setTerm(shardID string, term uint64) {
 	}
 }
 
+func replicateOp(op, key, value string) *commonv1.Operation {
+	switch op {
+	case "put":
+		return &commonv1.Operation{Type: commonv1.Operation_TYPE_PUT, Key: []byte(key), Value: []byte(value)}
+	case "delete":
+		return &commonv1.Operation{Type: commonv1.Operation_TYPE_DELETE, Key: []byte(key)}
+	default:
+		return &commonv1.Operation{Type: commonv1.Operation_TYPE_UNSPECIFIED, Key: []byte(key), Value: []byte(value)}
+	}
+}
+
 // --- fanOutReplicate ---
 
 func TestFanOutReplicate_NoFollowers(t *testing.T) {
@@ -96,19 +102,16 @@ func TestFanOutReplicate_NoFollowers(t *testing.T) {
 }
 
 func TestFanOutReplicate_AllAck(t *testing.T) {
-	makeFollower := func() *httptest.Server {
-		return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Content-Type", "application/json")
-			_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: 1})
-		}))
-	}
-	s1, s2 := makeFollower(), makeFollower()
-	defer s1.Close()
-	defer s2.Close()
+	s1 := startStubNodeGRPC(t, &stubNodeService{ReplicateFn: func(context.Context, *nodev1.ReplicateRequest) (*nodev1.ReplicateResponse, error) {
+		return &nodev1.ReplicateResponse{Success: true, Term: 1}, nil
+	}})
+	s2 := startStubNodeGRPC(t, &stubNodeService{ReplicateFn: func(context.Context, *nodev1.ReplicateRequest) (*nodev1.ReplicateResponse, error) {
+		return &nodev1.ReplicateResponse{Success: true, Term: 1}, nil
+	}})
 
 	peers := map[string]string{
-		"p1": s1.Listener.Addr().String(),
-		"p2": s2.Listener.Addr().String(),
+		"p1": s1,
+		"p2": s2,
 	}
 	acks := fanOutReplicate(context.Background(), "shard-0", ReplicateRequest{
 		Term: 1, Version: 2, Op: "put", Key: "x", Value: "y",
@@ -117,20 +120,16 @@ func TestFanOutReplicate_AllAck(t *testing.T) {
 }
 
 func TestFanOutReplicate_PartialAck(t *testing.T) {
-	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: true, Term: 1})
-	}))
-	defer good.Close()
-	bad := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Error: "term mismatch"})
-	}))
-	defer bad.Close()
+	good := startStubNodeGRPC(t, &stubNodeService{ReplicateFn: func(context.Context, *nodev1.ReplicateRequest) (*nodev1.ReplicateResponse, error) {
+		return &nodev1.ReplicateResponse{Success: true, Term: 1}, nil
+	}})
+	bad := startStubNodeGRPC(t, &stubNodeService{ReplicateFn: func(context.Context, *nodev1.ReplicateRequest) (*nodev1.ReplicateResponse, error) {
+		return &nodev1.ReplicateResponse{Success: false, Term: 1}, nil
+	}})
 
 	peers := map[string]string{
-		"good": good.Listener.Addr().String(),
-		"bad":  bad.Listener.Addr().String(),
+		"good": good,
+		"bad":  bad,
 	}
 	acks := fanOutReplicate(context.Background(), "shard-0", ReplicateRequest{
 		Term: 1, Version: 3, Op: "delete", Key: "x",
@@ -139,13 +138,12 @@ func TestFanOutReplicate_PartialAck(t *testing.T) {
 }
 
 func TestFanOutReplicate_Timeout(t *testing.T) {
-	slow := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	slow := startStubNodeGRPC(t, &stubNodeService{ReplicateFn: func(context.Context, *nodev1.ReplicateRequest) (*nodev1.ReplicateResponse, error) {
 		time.Sleep(2 * time.Second)
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer slow.Close()
+		return &nodev1.ReplicateResponse{Success: true, Term: 1}, nil
+	}})
 
-	peers := map[string]string{"slow": slow.Listener.Addr().String()}
+	peers := map[string]string{"slow": slow}
 	start := time.Now()
 	acks := fanOutReplicate(context.Background(), "shard-0", ReplicateRequest{
 		Term: 1, Version: 1, Op: "put", Key: "k", Value: "v",
@@ -156,22 +154,23 @@ func TestFanOutReplicate_Timeout(t *testing.T) {
 	assert.Less(t, elapsed, time.Second, "should return quickly after timeout")
 }
 
-// --- handleReplicate ---
+// --- Replicate ---
 
 func TestHandleReplicate_AppliesWrite(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	req := ReplicateRequest{Term: 1, Version: 1, Op: "put", Key: "hello", Value: "world"}
-	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Replicate(ctx, &nodev1.ReplicateRequest{
+		ShardId: "shard-0",
+		Term:    1,
+		Version: 1,
+		Op:      replicateOp("put", "hello", "world"),
+	})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var rr ReplicateResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
-	assert.True(t, rr.Success)
+	assert.True(t, resp.Success)
 
 	val, ok := follower.getKV("shard-0", "hello")
 	require.True(t, ok)
@@ -181,14 +180,18 @@ func TestHandleReplicate_AppliesWrite(t *testing.T) {
 func TestHandleReplicate_Delete(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
 	follower.setKV("shard-0", "gone", "value")
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	appendReq := ReplicateRequest{Term: 1, Version: 1, Op: "delete", Key: "gone"}
-	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(appendReq))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	_, err := client.Replicate(ctx, &nodev1.ReplicateRequest{
+		ShardId: "shard-0",
+		Term:    1,
+		Version: 1,
+		Op:      replicateOp("delete", "gone", ""),
+	})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	_, ok := follower.getKV("shard-0", "gone")
 	assert.False(t, ok, "key should have been deleted")
@@ -196,37 +199,38 @@ func TestHandleReplicate_Delete(t *testing.T) {
 
 func TestHandleReplicate_StaleTerm(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
-	follower.setTerm("shard-0", 5) // follower is at term 5
+	follower.setTerm("shard-0", 5)
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
-
-	// Send a replicate with an older term.
-	req := ReplicateRequest{Term: 2, Version: 1, Op: "put", Key: "k", Value: "v"}
-	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Replicate(ctx, &nodev1.ReplicateRequest{
+		ShardId: "shard-0",
+		Term:    2,
+		Version: 1,
+		Op:      replicateOp("put", "k", "v"),
+	})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-
-	var rr ReplicateResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
-	assert.False(t, rr.Success)
-	assert.Equal(t, uint64(5), rr.Term, "should echo the follower's current term")
+	assert.False(t, resp.Success)
+	assert.Equal(t, uint64(5), resp.Term)
 }
 
 func TestHandleReplicate_GapTriggersRecovery(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	// Send a replicate with a gap (version 3 before version 1/2).
-	req := ReplicateRequest{Term: 1, Version: 3, Op: "put", Key: "k", Value: "v"}
-	resp, err := http.Post(ts.URL+"/internal/replicate/shard-0", "application/json", jsonBody(req))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Replicate(ctx, &nodev1.ReplicateRequest{
+		ShardId: "shard-0",
+		Term:    1,
+		Version: 3,
+		Op:      replicateOp("put", "k", "v"),
+	})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-
-	var rr ReplicateResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
-	assert.False(t, rr.Success)
+	assert.False(t, resp.Success)
 
 	follower.mu.RLock()
 	replica := follower.replicas["shard-0"]
@@ -240,8 +244,8 @@ func TestHandleReplicate_GapTriggersRecovery(t *testing.T) {
 
 func TestHandleForceRecover_MarksNotReadyAndResetsLog(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
 	follower.mu.RLock()
 	replica := follower.replicas["shard-0"]
@@ -252,10 +256,10 @@ func TestHandleForceRecover_MarksNotReadyAndResetsLog(t *testing.T) {
 	replica.RepLog.Append(replicationlog.Entry{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v"})
 	replica.mu.Unlock()
 
-	resp, err := http.Post(ts.URL+"/internal/force_recover/shard-0", "application/json", nil)
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	_, err := client.ForceRecover(ctx, &nodev1.ForceRecoverRequest{ShardId: "shard-0"})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
 
 	replica.mu.RLock()
 	isReady := replica.IsReady
@@ -267,8 +271,8 @@ func TestHandleForceRecover_MarksNotReadyAndResetsLog(t *testing.T) {
 
 func TestHandleRecover_FollowerAheadGetsSnapshot(t *testing.T) {
 	leader := newTestServer("leader", "leader", []string{"leader"})
-	ts := httptest.NewServer(leader.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, addr)
 
 	leader.mu.RLock()
 	replica := leader.replicas["shard-0"]
@@ -281,123 +285,106 @@ func TestHandleRecover_FollowerAheadGetsSnapshot(t *testing.T) {
 	replica.mu.Unlock()
 	require.NoError(t, err)
 
-	resp, err := http.Get(ts.URL + "/internal/recover/shard-0?since_version=2")
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	recov, err := client.Recover(ctx, &nodev1.RecoverRequest{ShardId: "shard-0", SinceVersion: 2})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var rr RecoverResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&rr))
-	assert.Equal(t, "snapshot", rr.Type)
-	assert.Equal(t, uint64(1), rr.Version)
-	assert.Equal(t, "v", rr.KV["k"])
+	assert.Equal(t, nodev1.RecoverResponse_TYPE_SNAPSHOT, recov.Type)
+	assert.Equal(t, uint64(1), recov.Version)
+	assert.Equal(t, "v", string(recov.Kv[0].Value))
 }
 
 func TestHandleReplicate_UnknownShard(t *testing.T) {
 	srv := newTestServer("node", "node", []string{"node"})
-	ts := httptest.NewServer(srv.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, srv)
+	client := dialNodeClient(t, addr)
 
-	req := ReplicateRequest{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v"}
-	resp, err := http.Post(ts.URL+"/internal/replicate/no-such-shard", "application/json", jsonBody(req))
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	_, err := client.Replicate(ctx, &nodev1.ReplicateRequest{
+		ShardId: "no-such-shard",
+		Term:    1,
+		Version: 1,
+		Op:      replicateOp("put", "k", "v"),
+	})
+	require.Error(t, err)
+	assert.Equal(t, codes.NotFound, status.Code(err))
 }
 
-// --- handleSync ---
-
-func TestHandleSync_ReturnsSnapshot(t *testing.T) {
+func TestRecover_ReturnsSnapshot(t *testing.T) {
 	leader := newTestServer("leader", "leader", []string{"leader"})
 	leader.setKV("shard-0", "foo", "bar")
 	leader.setKV("shard-0", "baz", "qux")
+	addr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, addr)
 
-	ts := httptest.NewServer(leader.Handler())
-	defer ts.Close()
-
-	resp, err := http.Get(ts.URL + "/internal/sync/shard-0")
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	recov, err := client.Recover(ctx, &nodev1.RecoverRequest{ShardId: "shard-0", SinceVersion: 999})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var sr SyncResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&sr))
-	assert.Equal(t, "bar", sr.KV["foo"])
-	assert.Equal(t, "qux", sr.KV["baz"])
+	assert.Equal(t, nodev1.RecoverResponse_TYPE_SNAPSHOT, recov.Type)
+	kv := make(map[string]string)
+	for _, e := range recov.Kv {
+		kv[string(e.Key)] = string(e.Value)
+	}
+	assert.Equal(t, "bar", kv["foo"])
+	assert.Equal(t, "qux", kv["baz"])
 }
 
-func TestHandleSync_NonLeaderRejects(t *testing.T) {
+func TestRecover_NonLeaderRejects(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	resp, err := http.Get(ts.URL + "/internal/sync/shard-0")
-	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	_, err := client.Recover(ctx, &nodev1.RecoverRequest{ShardId: "shard-0", SinceVersion: 0})
+	require.Error(t, err)
+	assert.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
-// --- handleKV ---
+// --- KV operations ---
 
 func TestHandleKV_PutAndGet_SingleReplica(t *testing.T) {
-	// Single-replica shard: no followers needed for quorum.
 	leader := newTestServer("leader", "leader", []string{"leader"})
-	ts := httptest.NewServer(leader.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, addr)
 
-	// Put
-	putResp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
-		jsonBody(KVRequest{Op: "put", Key: "name", Value: "alice"}))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	putResp, err := client.Put(ctx, &nodev1.PutRequest{ShardId: "shard-0", Key: []byte("name"), Value: []byte("alice")})
 	require.NoError(t, err)
-	defer func() { _ = putResp.Body.Close() }()
-	require.Equal(t, http.StatusOK, putResp.StatusCode)
+	assert.Equal(t, nodev1.PutResponse_RESULT_OK, putResp.Result)
 
-	var kvr KVResponse
-	require.NoError(t, json.NewDecoder(putResp.Body).Decode(&kvr))
-	assert.True(t, kvr.OK)
-
-	// Get
-	getResp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
-		jsonBody(KVRequest{Op: "get", Key: "name"}))
+	getResp, err := client.Get(ctx, &nodev1.GetRequest{ShardId: "shard-0", Key: []byte("name")})
 	require.NoError(t, err)
-	defer func() { _ = getResp.Body.Close() }()
-	require.Equal(t, http.StatusOK, getResp.StatusCode)
-
-	var getKvr KVResponse
-	require.NoError(t, json.NewDecoder(getResp.Body).Decode(&getKvr))
-	assert.True(t, getKvr.OK)
-	assert.Equal(t, "alice", getKvr.Value)
+	assert.Equal(t, nodev1.GetResponse_RESULT_OK, getResp.Result)
+	assert.Equal(t, "alice", string(getResp.Value))
 }
 
 func TestHandleKV_GetMissing(t *testing.T) {
 	leader := newTestServer("leader", "leader", []string{"leader"})
-	ts := httptest.NewServer(leader.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, addr)
 
-	resp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
-		jsonBody(KVRequest{Op: "get", Key: "missing"}))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Get(ctx, &nodev1.GetRequest{ShardId: "shard-0", Key: []byte("missing")})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-
-	var kvr KVResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&kvr))
-	assert.False(t, kvr.OK)
+	assert.Equal(t, nodev1.GetResponse_RESULT_NOT_FOUND, resp.Result)
 }
 
 func TestHandleKV_DeleteSingleReplica(t *testing.T) {
 	leader := newTestServer("leader", "leader", []string{"leader"})
 	leader.setKV("shard-0", "del", "me")
-	ts := httptest.NewServer(leader.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, addr)
 
-	resp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
-		jsonBody(KVRequest{Op: "delete", Key: "del"}))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	delResp, err := client.Delete(ctx, &nodev1.DeleteRequest{ShardId: "shard-0", Key: []byte("del")})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-
-	var kvr KVResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&kvr))
-	assert.True(t, kvr.OK)
+	assert.Equal(t, nodev1.DeleteResponse_RESULT_OK, delResp.Result)
 
 	_, ok := leader.getKV("shard-0", "del")
 	assert.False(t, ok)
@@ -405,32 +392,23 @@ func TestHandleKV_DeleteSingleReplica(t *testing.T) {
 
 func TestHandleKV_NotLeaderReturnsError(t *testing.T) {
 	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	resp, err := http.Post(ts.URL+"/kv/shard-0", "application/json",
-		jsonBody(KVRequest{Op: "put", Key: "k", Value: "v"}))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Put(ctx, &nodev1.PutRequest{ShardId: "shard-0", Key: []byte("k"), Value: []byte("v")})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusMisdirectedRequest, resp.StatusCode)
-
-	var kvr KVResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&kvr))
-	assert.False(t, kvr.OK)
-	assert.Equal(t, "NOT_LEADER", kvr.Error)
-	assert.Equal(t, "leader", kvr.LeaderID)
+	assert.Equal(t, nodev1.PutResponse_RESULT_NOT_LEADER, resp.Result)
+	assert.Equal(t, "leader", resp.LeaderHint)
 }
 
 func TestHandleKV_PutWithFollowers_QuorumMet(t *testing.T) {
-	// Start two real follower servers using their own handlers.
 	f1 := newTestServer("f1", "leader", []string{"leader", "f1", "f2"})
 	f2 := newTestServer("f2", "leader", []string{"leader", "f1", "f2"})
-	ts1 := httptest.NewServer(f1.Handler())
-	defer ts1.Close()
-	ts2 := httptest.NewServer(f2.Handler())
-	defer ts2.Close()
+	addr1 := startTestNodeGRPC(t, f1)
+	addr2 := startTestNodeGRPC(t, f2)
 
-	// Build leader that knows about the followers' actual addresses.
 	leaderCfg := testNodeCfg("leader")
 	leader := NewServer(leaderCfg, nil)
 	leader.InitShards(coordinator.ShardMapResponse{
@@ -440,26 +418,21 @@ func TestHandleKV_PutWithFollowers_QuorumMet(t *testing.T) {
 		},
 		NodeAddresses: map[string]string{
 			"leader": "leader-addr",
-			"f1":     ts1.Listener.Addr().String(),
-			"f2":     ts2.Listener.Addr().String(),
+			"f1":     addr1,
+			"f2":     addr2,
 		},
 	})
-	lts := httptest.NewServer(leader.Handler())
-	defer lts.Close()
+	leaderAddr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, leaderAddr)
 
-	resp, err := http.Post(lts.URL+"/kv/shard-0", "application/json",
-		jsonBody(KVRequest{Op: "put", Key: "x", Value: "42"}))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Put(ctx, &nodev1.PutRequest{ShardId: "shard-0", Key: []byte("x"), Value: []byte("42")})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-
-	var kvr KVResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&kvr))
-	assert.True(t, kvr.OK, "write should succeed with quorum")
+	assert.Equal(t, nodev1.PutResponse_RESULT_OK, resp.Result)
 }
 
 func TestHandleKV_PutWithFollowers_QuorumUnavailable(t *testing.T) {
-	// Use an address that nothing is listening on — both followers are "dead".
 	leaderCfg := testNodeCfg("leader")
 	leaderCfg.QuorumTimeout = 100 * time.Millisecond
 	leader := NewServer(leaderCfg, nil)
@@ -470,20 +443,86 @@ func TestHandleKV_PutWithFollowers_QuorumUnavailable(t *testing.T) {
 		},
 		NodeAddresses: map[string]string{
 			"leader": "leader-addr",
-			"f1":     "127.0.0.1:1", // nothing listening here
-			"f2":     "127.0.0.1:2", // nothing listening here
+			"f1":     "127.0.0.1:1",
+			"f2":     "127.0.0.1:2",
 		},
 	})
-	lts := httptest.NewServer(leader.Handler())
-	defer lts.Close()
+	leaderAddr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, leaderAddr)
 
-	resp, err := http.Post(lts.URL+"/kv/shard-0", "application/json",
-		jsonBody(KVRequest{Op: "put", Key: "k", Value: "v"}))
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Put(ctx, &nodev1.PutRequest{ShardId: "shard-0", Key: []byte("k"), Value: []byte("v")})
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	assert.Equal(t, http.StatusServiceUnavailable, resp.StatusCode)
+	assert.Equal(t, nodev1.PutResponse_RESULT_QUORUM_UNAVAILABLE, resp.Result)
+}
 
-	var kvr KVResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&kvr))
-	assert.False(t, kvr.OK)
+func TestHandleKV_DeleteMapsToQuorumUnavailable(t *testing.T) {
+	leaderCfg := testNodeCfg("leader")
+	leaderCfg.QuorumTimeout = 100 * time.Millisecond
+	leader := NewServer(leaderCfg, nil)
+	leader.InitShards(coordinator.ShardMapResponse{
+		Version: 1,
+		Shards: []shardmap.ShardInfo{
+			{ID: "shard-0", Leader: "leader", Replicas: []string{"leader", "f1"}},
+		},
+		NodeAddresses: map[string]string{
+			"leader": "leader-addr",
+			"f1":     "127.0.0.1:1",
+		},
+	})
+	leaderAddr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, leaderAddr)
+
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Delete(ctx, &nodev1.DeleteRequest{ShardId: "shard-0", Key: []byte("k")})
+	require.NoError(t, err)
+	assert.Equal(t, nodev1.DeleteResponse_RESULT_QUORUM_UNAVAILABLE, resp.Result)
+}
+
+func TestHandleKV_LeaderHintForDelete(t *testing.T) {
+	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
+
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Delete(ctx, &nodev1.DeleteRequest{ShardId: "shard-0", Key: []byte("k")})
+	require.NoError(t, err)
+	assert.Equal(t, nodev1.DeleteResponse_RESULT_NOT_LEADER, resp.Result)
+	assert.Equal(t, "leader", resp.LeaderHint)
+}
+
+func TestHandleKV_LeaderHintForGet(t *testing.T) {
+	follower := newTestServer("follower", "leader", []string{"leader", "follower"})
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
+
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.Get(ctx, &nodev1.GetRequest{ShardId: "shard-0", Key: []byte("k")})
+	require.NoError(t, err)
+	assert.Equal(t, nodev1.GetResponse_RESULT_NOT_LEADER, resp.Result)
+	assert.Equal(t, "leader", resp.LeaderHint)
+}
+
+func TestHandleKV_PutAndGetWithReplicationLog(t *testing.T) {
+	leader := newTestServer("leader", "leader", []string{"leader"})
+	leader.mu.RLock()
+	replica := leader.replicas["shard-0"]
+	leader.mu.RUnlock()
+	before := replica.RepLog.Len()
+
+	addr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, addr)
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	_, err := client.Put(ctx, &nodev1.PutRequest{ShardId: "shard-0", Key: []byte("k"), Value: []byte("v")})
+	require.NoError(t, err)
+
+	replica.mu.RLock()
+	after := replica.RepLog.Len()
+	replica.mu.RUnlock()
+	assert.Greater(t, after, before)
 }

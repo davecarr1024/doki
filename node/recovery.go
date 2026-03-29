@@ -2,13 +2,16 @@ package node
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"time"
 
+	commonv1 "github.com/davecarr1024/doki/gen/doki/common/v1"
+	nodev1 "github.com/davecarr1024/doki/gen/doki/node/v1"
 	"github.com/davecarr1024/doki/internal/metrics"
+	"github.com/davecarr1024/doki/internal/replicationlog"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // SyncResponse is returned by GET /internal/sync/{shard_id}.
@@ -41,36 +44,39 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		sinceVersion = 0 // always start fresh from the source
 	}
 
-	url := fmt.Sprintf("http://%s/internal/recover/%s?since_version=%d",
-		leaderAddr, recoverShardID, sinceVersion)
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	conn, err := grpc.DialContext(ctx, leaderAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
-		return "", fmt.Errorf("build recover request: %w", err)
+		return "", fmt.Errorf("dial leader: %w", err)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	defer func() { _ = conn.Close() }()
+
+	client := nodev1.NewNodeServiceClient(conn)
+	resp, err := client.Recover(ctx, &nodev1.RecoverRequest{
+		ShardId:      recoverShardID,
+		SinceVersion: sinceVersion,
+	})
 	if err != nil {
 		return "", fmt.Errorf("recover request: %w", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("recover request status %d", resp.StatusCode)
-	}
-	var recoverResp RecoverResponse
-	if err := json.NewDecoder(resp.Body).Decode(&recoverResp); err != nil {
-		return "", fmt.Errorf("decode recover response: %w", err)
 	}
 
 	replica.mu.Lock()
 	defer replica.mu.Unlock()
 
-	switch recoverResp.Type {
-	case "entries":
-		for _, e := range recoverResp.Entries {
+	switch resp.Type {
+	case nodev1.RecoverResponse_TYPE_ENTRIES:
+		for _, e := range resp.Entries {
 			// Skip entries we already have (may arrive via replication concurrently).
 			if e.Version <= replica.Version {
 				continue
 			}
-			if err := applyReplicatedEntryLocked(replica, e, ds); err != nil {
+			entry := replicationlog.Entry{
+				Term:    e.Term,
+				Version: e.Version,
+				Op:      opTypeFromProto(e.Op),
+				Key:     string(e.Op.GetKey()),
+				Value:   string(e.Op.GetValue()),
+			}
+			if err := applyReplicatedEntryLocked(replica, entry, ds); err != nil {
 				return "", fmt.Errorf("apply entry: %w", err)
 			}
 		}
@@ -79,17 +85,18 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""
 		log.Printf("incremental recovery complete shard_id=%s version=%d entries=%d",
-			shardID, replica.Version, len(recoverResp.Entries))
+			shardID, replica.Version, len(resp.Entries))
 		return "incremental", nil
 
-	case "snapshot":
-		replica.KV.ApplySnapshot(recoverResp.KV)
-		replica.Version = recoverResp.Version
-		replica.Term = recoverResp.Term
+	case nodev1.RecoverResponse_TYPE_SNAPSHOT:
+		kv := kvFromProto(resp.Kv)
+		replica.KV.ApplySnapshot(kv)
+		replica.Version = resp.Version
+		replica.Term = resp.Term
 		replica.IsReady = true
 		replica.RepLog.Reset()
 		if ds != nil {
-			if err := ds.resetSnapshot(recoverResp.Term, recoverResp.Version, recoverResp.KV); err != nil {
+			if err := ds.resetSnapshot(resp.Term, resp.Version, kv); err != nil {
 				return "", fmt.Errorf("disk snapshot reset: %w", err)
 			}
 		}
@@ -97,11 +104,11 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""
 		log.Printf("snapshot fallback recovery complete shard_id=%s version=%d term=%d",
-			shardID, recoverResp.Version, recoverResp.Term)
+			shardID, resp.Version, resp.Term)
 		return "snapshot", nil
 
 	default:
-		return "", fmt.Errorf("unknown recovery response type %q", recoverResp.Type)
+		return "", fmt.Errorf("unknown recovery response type %v", resp.Type)
 	}
 }
 
@@ -153,5 +160,30 @@ func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr f
 				}
 			}
 		}
+	}
+}
+
+func kvFromProto(entries []*commonv1.KVEntry) map[string]string {
+	if len(entries) == 0 {
+		return map[string]string{}
+	}
+	kv := make(map[string]string, len(entries))
+	for _, e := range entries {
+		kv[string(e.Key)] = string(e.Value)
+	}
+	return kv
+}
+
+func opTypeFromProto(op *commonv1.Operation) string {
+	if op == nil {
+		return ""
+	}
+	switch op.Type {
+	case commonv1.Operation_TYPE_PUT:
+		return "put"
+	case commonv1.Operation_TYPE_DELETE:
+		return "delete"
+	default:
+		return ""
 	}
 }

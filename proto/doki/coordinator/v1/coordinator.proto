@@ -59,6 +59,7 @@ message GetShardMapRequest {}
 
 message GetShardMapResponse {
   doki.common.v1.ShardMap shard_map = 1;
+  map<string, string> node_addresses = 2;
 }
 
 // --- Leader query ---
@@ -69,6 +70,8 @@ message WhereIsLeaderRequest {
 
 message WhereIsLeaderResponse {
   string leader_node_id = 1;
+  string address = 2;
+  uint64 term = 3;
 }
 
 // --- Status ---

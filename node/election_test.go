@@ -2,12 +2,11 @@ package node
 
 import (
 	"context"
-	"encoding/json"
-	"net/http"
-	"net/http/httptest"
 	"testing"
 	"time"
 
+	coordinatorv1 "github.com/davecarr1024/doki/gen/doki/coordinator/v1"
+	nodev1 "github.com/davecarr1024/doki/gen/doki/node/v1"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
 	"github.com/stretchr/testify/assert"
@@ -41,15 +40,15 @@ func (s *Server) setVersion(shardID string, version uint64) {
 	}
 }
 
-// --- handleRequestVote ---
+// --- RequestVote ---
 
 func TestHandleRequestVote_GrantVote(t *testing.T) {
 	follower := newElectionTestServer("follower", "leader", []string{"leader"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	req := VoteRequest{Term: 2, CandidateID: "leader", Version: 0}
-	resp := doVoteRequest(t, ts.URL, "shard-0", req)
+	req := &nodev1.VoteRequest{Term: 2, CandidateId: "leader", Version: 0, ShardId: "shard-0"}
+	resp := doVoteRequest(t, client, req)
 	assert.True(t, resp.VoteGranted)
 	assert.Equal(t, uint64(2), resp.Term)
 }
@@ -57,79 +56,73 @@ func TestHandleRequestVote_GrantVote(t *testing.T) {
 func TestHandleRequestVote_RejectStaleTerm(t *testing.T) {
 	follower := newElectionTestServer("follower", "leader", []string{"leader"})
 	follower.setTerm("shard-0", 5)
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	req := VoteRequest{Term: 3, CandidateID: "leader", Version: 0}
-	resp := doVoteRequest(t, ts.URL, "shard-0", req)
+	req := &nodev1.VoteRequest{Term: 3, CandidateId: "leader", Version: 0, ShardId: "shard-0"}
+	resp := doVoteRequest(t, client, req)
 	assert.False(t, resp.VoteGranted)
-	assert.Equal(t, uint64(5), resp.Term) // returns current term
+	assert.Equal(t, uint64(5), resp.Term)
 }
 
 func TestHandleRequestVote_GrantIdempotent(t *testing.T) {
-	// Granting the same vote twice should succeed (idempotent).
 	follower := newElectionTestServer("follower", "leader", []string{"leader"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	req := VoteRequest{Term: 2, CandidateID: "leader", Version: 0}
-	r1 := doVoteRequest(t, ts.URL, "shard-0", req)
-	r2 := doVoteRequest(t, ts.URL, "shard-0", req)
+	req := &nodev1.VoteRequest{Term: 2, CandidateId: "leader", Version: 0, ShardId: "shard-0"}
+	r1 := doVoteRequest(t, client, req)
+	r2 := doVoteRequest(t, client, req)
 	assert.True(t, r1.VoteGranted)
 	assert.True(t, r2.VoteGranted)
 }
 
 func TestHandleRequestVote_RejectDoubleVote(t *testing.T) {
-	// After voting for candidate-a, deny candidate-b in the same term.
 	follower := newElectionTestServer("follower", "candidate-a", []string{"candidate-a", "candidate-b"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	r1 := doVoteRequest(t, ts.URL, "shard-0", VoteRequest{Term: 2, CandidateID: "candidate-a", Version: 0})
-	r2 := doVoteRequest(t, ts.URL, "shard-0", VoteRequest{Term: 2, CandidateID: "candidate-b", Version: 0})
+	r1 := doVoteRequest(t, client, &nodev1.VoteRequest{Term: 2, CandidateId: "candidate-a", Version: 0, ShardId: "shard-0"})
+	r2 := doVoteRequest(t, client, &nodev1.VoteRequest{Term: 2, CandidateId: "candidate-b", Version: 0, ShardId: "shard-0"})
 	assert.True(t, r1.VoteGranted)
 	assert.False(t, r2.VoteGranted)
 }
 
 func TestHandleRequestVote_RejectStalerVersion(t *testing.T) {
-	// Candidate version behind follower → reject.
 	follower := newElectionTestServer("follower", "leader", []string{"leader"})
 	follower.setVersion("shard-0", 10)
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	req := VoteRequest{Term: 2, CandidateID: "leader", Version: 5}
-	resp := doVoteRequest(t, ts.URL, "shard-0", req)
+	req := &nodev1.VoteRequest{Term: 2, CandidateId: "leader", Version: 5, ShardId: "shard-0"}
+	resp := doVoteRequest(t, client, req)
 	assert.False(t, resp.VoteGranted)
 }
 
 func TestHandleRequestVote_HigherTermResetsVote(t *testing.T) {
-	// Vote granted in term 2 for candidate-a, then term 3 arrives — follower
-	// should be able to vote for a different candidate in term 3.
 	follower := newElectionTestServer("follower", "candidate-a", []string{"candidate-a", "candidate-b"})
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	r1 := doVoteRequest(t, ts.URL, "shard-0", VoteRequest{Term: 2, CandidateID: "candidate-a", Version: 0})
+	r1 := doVoteRequest(t, client, &nodev1.VoteRequest{Term: 2, CandidateId: "candidate-a", Version: 0, ShardId: "shard-0"})
 	require.True(t, r1.VoteGranted)
 
-	r2 := doVoteRequest(t, ts.URL, "shard-0", VoteRequest{Term: 3, CandidateID: "candidate-b", Version: 0})
+	r2 := doVoteRequest(t, client, &nodev1.VoteRequest{Term: 3, CandidateId: "candidate-b", Version: 0, ShardId: "shard-0"})
 	assert.True(t, r2.VoteGranted)
 }
 
-// --- handleLeaderHeartbeat ---
+// --- LeaderHeartbeat ---
 
 func TestHandleLeaderHeartbeat_AcceptsValid(t *testing.T) {
 	follower := newElectionTestServer("follower", "leader", []string{"leader"})
 	follower.setTerm("shard-0", 1)
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	req := LeaderHeartbeatRequest{Term: 1, Version: 0, LeaderID: "leader", ShardID: "shard-0"}
-	resp := doLeaderHeartbeat(t, ts.URL, "shard-0", req)
+	req := &nodev1.LeaderHeartbeatRequest{Term: 1, Version: 0, LeaderId: "leader", ShardId: "shard-0"}
+	resp := doLeaderHeartbeat(t, client, req)
 	assert.Equal(t, uint64(1), resp.Term)
 
-	// Verify LastLeaderContact was set.
 	follower.mu.RLock()
 	r := follower.replicas["shard-0"]
 	follower.mu.RUnlock()
@@ -142,20 +135,17 @@ func TestHandleLeaderHeartbeat_AcceptsValid(t *testing.T) {
 func TestHandleLeaderHeartbeat_RejectsStaleTerm(t *testing.T) {
 	follower := newElectionTestServer("follower", "leader", []string{"leader"})
 	follower.setTerm("shard-0", 5)
-	ts := httptest.NewServer(follower.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, follower)
+	client := dialNodeClient(t, addr)
 
-	req := LeaderHeartbeatRequest{Term: 3, Version: 0, LeaderID: "leader", ShardID: "shard-0"}
-	resp := doLeaderHeartbeat(t, ts.URL, "shard-0", req)
-	// Should still return 200 with our current term so the stale leader knows to step down.
+	req := &nodev1.LeaderHeartbeatRequest{Term: 3, Version: 0, LeaderId: "leader", ShardId: "shard-0"}
+	resp := doLeaderHeartbeat(t, client, req)
 	assert.Equal(t, uint64(5), resp.Term)
 }
 
 func TestHandleLeaderHeartbeat_HigherTermDemotes(t *testing.T) {
-	// A node that thinks it is leader receives a heartbeat with a higher term.
 	leader := newElectionTestServer("node-a", "node-a", []string{"node-b"})
 	leader.setTerm("shard-0", 2)
-	// Manually promote to leader.
 	leader.mu.RLock()
 	r := leader.replicas["shard-0"]
 	leader.mu.RUnlock()
@@ -163,45 +153,37 @@ func TestHandleLeaderHeartbeat_HigherTermDemotes(t *testing.T) {
 	r.Role = RoleLeader
 	r.mu.Unlock()
 
-	ts := httptest.NewServer(leader.Handler())
-	defer ts.Close()
+	addr := startTestNodeGRPC(t, leader)
+	client := dialNodeClient(t, addr)
 
-	req := LeaderHeartbeatRequest{Term: 5, Version: 0, LeaderID: "node-b", ShardID: "shard-0"}
-	resp := doLeaderHeartbeat(t, ts.URL, "shard-0", req)
+	req := &nodev1.LeaderHeartbeatRequest{Term: 5, Version: 0, LeaderId: "node-b", ShardId: "shard-0"}
+	resp := doLeaderHeartbeat(t, client, req)
 	assert.Equal(t, uint64(5), resp.Term)
 
 	r.mu.RLock()
 	role := r.Role
 	term := r.Term
 	r.mu.RUnlock()
-	assert.Equal(t, RoleFollower, role, "should have stepped down")
+	assert.Equal(t, RoleFollower, role)
 	assert.Equal(t, uint64(5), term)
 }
 
 // --- startElection ---
 
 func TestStartElection_WinsWithMajority(t *testing.T) {
-	// 3-node shard: node-a is follower with two peers that both grant votes.
-	// node-a should win and become leader.
 	votes := 0
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	peerAddr := startStubNodeGRPC(t, &stubNodeService{RequestVoteFn: func(context.Context, *nodev1.VoteRequest) (*nodev1.VoteResponse, error) {
 		votes++
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(VoteResponse{Term: 2, VoteGranted: true})
-	}))
-	defer peer.Close()
-	peerAddr := peer.Listener.Addr().String()
+		return &nodev1.VoteResponse{Term: 2, VoteGranted: true}, nil
+	}})
 
-	// Build a fake coordinator that never responds (election doesn't depend on it).
-	fakeCoord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_ = json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
-	}))
-	defer fakeCoord.Close()
+	coordAddr := startStubCoordinatorGRPC(t, &stubCoordinatorService{NotifyLeaderFn: func(context.Context, *coordinatorv1.NotifyLeaderRequest) (*coordinatorv1.NotifyLeaderResponse, error) {
+		return &coordinatorv1.NotifyLeaderResponse{Accepted: true}, nil
+	}})
 
 	cfg := &config.NodeConfig{
 		Node:               config.NodeSpec{ID: "node-a", Address: "127.0.0.1:0"},
-		CoordinatorAddress: fakeCoord.Listener.Addr().String(),
+		CoordinatorAddress: coordAddr,
 		HeartbeatInterval:  100 * time.Millisecond,
 		QuorumTimeout:      500 * time.Millisecond,
 	}
@@ -210,7 +192,6 @@ func TestStartElection_WinsWithMajority(t *testing.T) {
 		[]string{"node-a", "node-b"},
 		map[string]string{"node-a": "127.0.0.1:0", "node-b": peerAddr},
 	))
-	// Manually set node-b's address.
 	srv.mu.Lock()
 	srv.nodeAddresses["node-b"] = peerAddr
 	srv.mu.Unlock()
@@ -219,7 +200,6 @@ func TestStartElection_WinsWithMajority(t *testing.T) {
 	replica := srv.replicas["shard-0"]
 	srv.mu.RUnlock()
 
-	// Set term to 1 so election bumps to 2.
 	replica.mu.Lock()
 	replica.Term = 1
 	replica.mu.Unlock()
@@ -231,49 +211,39 @@ func TestStartElection_WinsWithMajority(t *testing.T) {
 	term := replica.Term
 	replica.mu.RUnlock()
 
-	assert.Equal(t, RoleLeader, role, "node-a should have won election")
+	assert.Equal(t, RoleLeader, role)
 	assert.Equal(t, uint64(2), term)
-	assert.Equal(t, 1, votes, "peer should have received exactly one vote request")
+	assert.Equal(t, 1, votes)
 }
 
 func TestStartElection_FailsWithoutQuorum(t *testing.T) {
-	// Peer rejects the vote — no quorum.
-	peer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(VoteResponse{Term: 2, VoteGranted: false})
-	}))
-	defer peer.Close()
+	peerAddr := startStubNodeGRPC(t, &stubNodeService{RequestVoteFn: func(context.Context, *nodev1.VoteRequest) (*nodev1.VoteResponse, error) {
+		return &nodev1.VoteResponse{Term: 2, VoteGranted: false}, nil
+	}})
+	peer2Addr := startStubNodeGRPC(t, &stubNodeService{RequestVoteFn: func(context.Context, *nodev1.VoteRequest) (*nodev1.VoteResponse, error) {
+		return &nodev1.VoteResponse{Term: 2, VoteGranted: false}, nil
+	}})
 
-	fakeCoord := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	defer fakeCoord.Close()
+	coordAddr := startStubCoordinatorGRPC(t, &stubCoordinatorService{})
 
 	cfg := &config.NodeConfig{
 		Node:               config.NodeSpec{ID: "node-a", Address: "127.0.0.1:0"},
-		CoordinatorAddress: fakeCoord.Listener.Addr().String(),
+		CoordinatorAddress: coordAddr,
 		HeartbeatInterval:  100 * time.Millisecond,
 		QuorumTimeout:      500 * time.Millisecond,
 	}
 	srv := NewServer(cfg, clock.Real{})
-	// 3 replicas → quorum = 2; need 1 follower ACK + self; peer rejects so no quorum.
-	peer2 := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(VoteResponse{Term: 2, VoteGranted: false})
-	}))
-	defer peer2.Close()
-
 	srv.InitShards(testShardMapResp("shard-0", "node-b",
 		[]string{"node-a", "node-b", "node-c"},
 		map[string]string{
 			"node-a": "127.0.0.1:0",
-			"node-b": peer.Listener.Addr().String(),
-			"node-c": peer2.Listener.Addr().String(),
+			"node-b": peerAddr,
+			"node-c": peer2Addr,
 		},
 	))
 	srv.mu.Lock()
-	srv.nodeAddresses["node-b"] = peer.Listener.Addr().String()
-	srv.nodeAddresses["node-c"] = peer2.Listener.Addr().String()
+	srv.nodeAddresses["node-b"] = peerAddr
+	srv.nodeAddresses["node-c"] = peer2Addr
 	srv.mu.Unlock()
 
 	srv.mu.RLock()
@@ -289,37 +259,25 @@ func TestStartElection_FailsWithoutQuorum(t *testing.T) {
 	role := replica.Role
 	replica.mu.RUnlock()
 
-	assert.Equal(t, RoleFollower, role, "node-a should remain follower without quorum")
+	assert.Equal(t, RoleFollower, role)
 }
 
 // --- helpers ---
 
-func doVoteRequest(t *testing.T, baseURL, shardID string, req VoteRequest) VoteResponse {
+func doVoteRequest(t *testing.T, client nodev1.NodeServiceClient, req *nodev1.VoteRequest) *nodev1.VoteResponse {
 	t.Helper()
-	resp, err := http.Post(
-		baseURL+"/internal/request_vote/"+shardID,
-		"application/json",
-		jsonBody(req),
-	)
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.RequestVote(ctx, req)
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	var vr VoteResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&vr))
-	return vr
+	return resp
 }
 
-func doLeaderHeartbeat(t *testing.T, baseURL, shardID string, req LeaderHeartbeatRequest) LeaderHeartbeatResponse {
+func doLeaderHeartbeat(t *testing.T, client nodev1.NodeServiceClient, req *nodev1.LeaderHeartbeatRequest) *nodev1.LeaderHeartbeatResponse {
 	t.Helper()
-	resp, err := http.Post(
-		baseURL+"/internal/leader_heartbeat/"+shardID,
-		"application/json",
-		jsonBody(req),
-	)
+	ctx, cancel := grpcContext(time.Second)
+	defer cancel()
+	resp, err := client.LeaderHeartbeat(ctx, req)
 	require.NoError(t, err)
-	defer func() { _ = resp.Body.Close() }()
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	var hr LeaderHeartbeatResponse
-	require.NoError(t, json.NewDecoder(resp.Body).Decode(&hr))
-	return hr
+	return resp
 }

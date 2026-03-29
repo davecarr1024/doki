@@ -3,16 +3,21 @@ package coordinator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"time"
 
+	coordinatorv1 "github.com/davecarr1024/doki/gen/doki/coordinator/v1"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
 	"github.com/davecarr1024/doki/internal/metrics"
 	"github.com/davecarr1024/doki/internal/shardmap"
+	"github.com/soheilhy/cmux"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 // Server is the coordinator's HTTP server.
@@ -43,6 +48,7 @@ type Server struct {
 	clock      clock.Clock
 	m          *metrics.CoordinatorMetrics
 	httpServer *http.Server
+	grpcServer *grpc.Server
 	ready      bool
 }
 
@@ -77,21 +83,11 @@ func (s *Server) Init() error {
 
 // Start begins serving HTTP on the configured address.
 func (s *Server) Start(ctx context.Context) error {
-	mux := http.NewServeMux()
-	s.registerRoutes(mux)
-	s.httpServer = &http.Server{Addr: s.cfg.Coordinator.Address, Handler: mux}
-	go s.runHealthMonitor(ctx)
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = s.httpServer.Shutdown(shutCtx)
-	}()
-	log.Printf("coordinator listening address=%s", s.cfg.Coordinator.Address)
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("coordinator http server: %w", err)
+	l, err := net.Listen("tcp", s.cfg.Coordinator.Address)
+	if err != nil {
+		return fmt.Errorf("coordinator listen: %w", err)
 	}
-	return nil
+	return s.StartOnListener(ctx, l)
 }
 
 // StartOnListener starts the server on the provided net.Listener (used in tests).
@@ -99,28 +95,50 @@ func (s *Server) StartOnListener(ctx context.Context, l net.Listener) error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 	s.httpServer = &http.Server{Handler: mux}
+	s.grpcServer = grpc.NewServer()
+	coordinatorv1.RegisterCoordinatorServiceServer(s.grpcServer, &grpcServer{s: s})
+	reflection.Register(s.grpcServer)
+
+	m := cmux.New(l)
+	grpcL := m.Match(cmux.HTTP2())
+	httpL := m.Match(cmux.Any())
+
 	go s.runHealthMonitor(ctx)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.grpcServer.Serve(grpcL)
+	}()
+	go func() {
+		if err := s.httpServer.Serve(httpL); err != nil && err != http.ErrServerClosed {
+			errCh <- fmt.Errorf("coordinator http server: %w", err)
+		}
+	}()
+	go func() {
+		if err := m.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errCh <- fmt.Errorf("coordinator cmux: %w", err)
+		}
+	}()
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		s.grpcServer.GracefulStop()
 		_ = s.httpServer.Shutdown(shutCtx)
+		_ = l.Close()
 	}()
+
 	log.Printf("coordinator listening address=%s", l.Addr())
-	if err := s.httpServer.Serve(l); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("coordinator http server: %w", err)
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return nil
 	}
-	return nil
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("POST /heartbeat", s.handleHeartbeat)
-	mux.HandleFunc("GET /shardmap", s.handleShardMap)
-	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ready", s.handleReady)
-	mux.HandleFunc("GET /leader/{shard_id}", s.handleLeaderQuery)
-	// Phase 4: distributed election notification.
-	mux.HandleFunc("POST /notify_leader", s.handleNotifyLeader)
 	// Phase 5: dynamic cluster management.
 	mux.HandleFunc("POST /admin/add_node", s.handleAdminAddNode)
 	mux.HandleFunc("POST /admin/migrate_shard", s.handleAdminMigrateShard)
@@ -153,9 +171,9 @@ func (s *Server) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 // NodeAddresses maps node IDs to their HTTP addresses so nodes can
 // contact each other for replication and recovery.
 type ShardMapResponse struct {
-	Version       uint64            `json:"version"`
+	Version       uint64               `json:"version"`
 	Shards        []shardmap.ShardInfo `json:"shards"`
-	NodeAddresses map[string]string `json:"node_addresses"`
+	NodeAddresses map[string]string    `json:"node_addresses"`
 }
 
 func (s *Server) handleShardMap(w http.ResponseWriter, r *http.Request) {

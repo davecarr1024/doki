@@ -1,12 +1,13 @@
 package node
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
-	"net/http"
 	"sync"
 	"time"
+
+	nodev1 "github.com/davecarr1024/doki/gen/doki/node/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // ReplicateRequest is sent from a leader to each follower to append a pending write.
@@ -60,29 +61,23 @@ func fanOutReplicate(ctx context.Context, shardID string, req ReplicateRequest, 
 }
 
 func sendReplicateRequest(ctx context.Context, peerAddr, shardID string, req ReplicateRequest) bool {
-	body, err := json.Marshal(req)
+	conn, err := grpc.DialContext(ctx, peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
 		return false
 	}
-	url := "http://" + peerAddr + "/internal/replicate/" + shardID
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+	defer func() { _ = conn.Close() }()
+
+	client := nodev1.NewNodeServiceClient(conn)
+	resp, err := client.Replicate(ctx, &nodev1.ReplicateRequest{
+		ShardId: shardID,
+		Term:    req.Term,
+		Version: req.Version,
+		Op:      opToProto(req.Op, req.Key, req.Value),
+	})
 	if err != nil {
 		return false
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var rr ReplicateResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rr); err != nil {
-		return false
-	}
-	return rr.Success
+	return resp.Success
 }
 
 // fanOutForceRecover triggers recovery on a list of peers. Best-effort.
@@ -122,15 +117,13 @@ func fanOutForceRecover(ctx context.Context, shardID string, peerAddresses map[s
 }
 
 func sendForceRecoverRequest(ctx context.Context, peerAddr, shardID string) bool {
-	url := "http://" + peerAddr + "/internal/force_recover/" + shardID
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(nil))
+	conn, err := grpc.DialContext(ctx, peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
 		return false
 	}
-	resp, err := http.DefaultClient.Do(httpReq)
-	if err != nil {
-		return false
-	}
-	defer func() { _ = resp.Body.Close() }()
-	return resp.StatusCode == http.StatusOK
+	defer func() { _ = conn.Close() }()
+
+	client := nodev1.NewNodeServiceClient(conn)
+	_, err = client.ForceRecover(ctx, &nodev1.ForceRecoverRequest{ShardId: shardID})
+	return err == nil
 }

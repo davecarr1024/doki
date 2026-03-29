@@ -35,6 +35,14 @@ service NodeService {
   // ForceRecover marks a replica not-ready so it re-enters recovery.
   rpc ForceRecover(ForceRecoverRequest) returns (ForceRecoverResponse);
 
+  // --- Elections ---
+
+  // RequestVote asks a peer for a vote in a given term.
+  rpc RequestVote(VoteRequest) returns (VoteResponse);
+
+  // LeaderHeartbeat informs followers that the leader is alive.
+  rpc LeaderHeartbeat(LeaderHeartbeatRequest) returns (LeaderHeartbeatResponse);
+
   // SyncState streams a full-state snapshot from leader to a recovering follower.
   rpc SyncState(SyncStateRequest) returns (stream SyncStateResponse);
 
@@ -156,6 +164,31 @@ message ForceRecoverRequest {
 }
 
 message ForceRecoverResponse {}
+
+// --- Elections ---
+
+message VoteRequest {
+  uint64 term = 1;
+  string candidate_id = 2;
+  uint64 version = 3;
+  string shard_id = 4;
+}
+
+message VoteResponse {
+  uint64 term = 1;
+  bool vote_granted = 2;
+}
+
+message LeaderHeartbeatRequest {
+  uint64 term = 1;
+  uint64 version = 2;
+  string leader_id = 3;
+  string shard_id = 4;
+}
+
+message LeaderHeartbeatResponse {
+  uint64 term = 1;
+}
 
 // --- SyncState (snapshot recovery) ---
 

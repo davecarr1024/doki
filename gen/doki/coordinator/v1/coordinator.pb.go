@@ -234,6 +234,7 @@ func (*GetShardMapRequest) Descriptor() ([]byte, []int) {
 type GetShardMapResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ShardMap      *v1.ShardMap           `protobuf:"bytes,1,opt,name=shard_map,json=shardMap,proto3" json:"shard_map,omitempty"`
+	NodeAddresses map[string]string      `protobuf:"bytes,2,rep,name=node_addresses,json=nodeAddresses,proto3" json:"node_addresses,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"bytes,2,opt,name=value"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -271,6 +272,13 @@ func (*GetShardMapResponse) Descriptor() ([]byte, []int) {
 func (x *GetShardMapResponse) GetShardMap() *v1.ShardMap {
 	if x != nil {
 		return x.ShardMap
+	}
+	return nil
+}
+
+func (x *GetShardMapResponse) GetNodeAddresses() map[string]string {
+	if x != nil {
+		return x.NodeAddresses
 	}
 	return nil
 }
@@ -322,6 +330,8 @@ func (x *WhereIsLeaderRequest) GetShardId() string {
 type WhereIsLeaderResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	LeaderNodeId  string                 `protobuf:"bytes,1,opt,name=leader_node_id,json=leaderNodeId,proto3" json:"leader_node_id,omitempty"`
+	Address       string                 `protobuf:"bytes,2,opt,name=address,proto3" json:"address,omitempty"`
+	Term          uint64                 `protobuf:"varint,3,opt,name=term,proto3" json:"term,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -361,6 +371,20 @@ func (x *WhereIsLeaderResponse) GetLeaderNodeId() string {
 		return x.LeaderNodeId
 	}
 	return ""
+}
+
+func (x *WhereIsLeaderResponse) GetAddress() string {
+	if x != nil {
+		return x.Address
+	}
+	return ""
+}
+
+func (x *WhereIsLeaderResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
 }
 
 type GetStatusRequest struct {
@@ -655,13 +679,19 @@ const file_doki_coordinator_v1_coordinator_proto_rawDesc = "" +
 	"\x06shards\x18\x02 \x03(\v2#.doki.coordinator.v1.ShardHeartbeatR\x06shards\"?\n" +
 	"\x11HeartbeatResponse\x12*\n" +
 	"\x11shard_map_version\x18\x01 \x01(\x04R\x0fshardMapVersion\"\x14\n" +
-	"\x12GetShardMapRequest\"L\n" +
+	"\x12GetShardMapRequest\"\xf2\x01\n" +
 	"\x13GetShardMapResponse\x125\n" +
-	"\tshard_map\x18\x01 \x01(\v2\x18.doki.common.v1.ShardMapR\bshardMap\"1\n" +
+	"\tshard_map\x18\x01 \x01(\v2\x18.doki.common.v1.ShardMapR\bshardMap\x12b\n" +
+	"\x0enode_addresses\x18\x02 \x03(\v2;.doki.coordinator.v1.GetShardMapResponse.NodeAddressesEntryR\rnodeAddresses\x1a@\n" +
+	"\x12NodeAddressesEntry\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\tR\x05value:\x028\x01\"1\n" +
 	"\x14WhereIsLeaderRequest\x12\x19\n" +
-	"\bshard_id\x18\x01 \x01(\tR\ashardId\"=\n" +
+	"\bshard_id\x18\x01 \x01(\tR\ashardId\"k\n" +
 	"\x15WhereIsLeaderResponse\x12$\n" +
-	"\x0eleader_node_id\x18\x01 \x01(\tR\fleaderNodeId\"\x12\n" +
+	"\x0eleader_node_id\x18\x01 \x01(\tR\fleaderNodeId\x12\x18\n" +
+	"\aaddress\x18\x02 \x01(\tR\aaddress\x12\x12\n" +
+	"\x04term\x18\x03 \x01(\x04R\x04term\"\x12\n" +
 	"\x10GetStatusRequest\"\x8b\x01\n" +
 	"\x0fNodeHealthEntry\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x18\n" +
@@ -698,7 +728,7 @@ func file_doki_coordinator_v1_coordinator_proto_rawDescGZIP() []byte {
 	return file_doki_coordinator_v1_coordinator_proto_rawDescData
 }
 
-var file_doki_coordinator_v1_coordinator_proto_msgTypes = make([]protoimpl.MessageInfo, 12)
+var file_doki_coordinator_v1_coordinator_proto_msgTypes = make([]protoimpl.MessageInfo, 13)
 var file_doki_coordinator_v1_coordinator_proto_goTypes = []any{
 	(*ShardHeartbeat)(nil),        // 0: doki.coordinator.v1.ShardHeartbeat
 	(*HeartbeatRequest)(nil),      // 1: doki.coordinator.v1.HeartbeatRequest
@@ -712,29 +742,31 @@ var file_doki_coordinator_v1_coordinator_proto_goTypes = []any{
 	(*GetStatusResponse)(nil),     // 9: doki.coordinator.v1.GetStatusResponse
 	(*NotifyLeaderRequest)(nil),   // 10: doki.coordinator.v1.NotifyLeaderRequest
 	(*NotifyLeaderResponse)(nil),  // 11: doki.coordinator.v1.NotifyLeaderResponse
-	(*v1.ShardMap)(nil),           // 12: doki.common.v1.ShardMap
-	(*v1.ShardInfo)(nil),          // 13: doki.common.v1.ShardInfo
+	nil,                           // 12: doki.coordinator.v1.GetShardMapResponse.NodeAddressesEntry
+	(*v1.ShardMap)(nil),           // 13: doki.common.v1.ShardMap
+	(*v1.ShardInfo)(nil),          // 14: doki.common.v1.ShardInfo
 }
 var file_doki_coordinator_v1_coordinator_proto_depIdxs = []int32{
 	0,  // 0: doki.coordinator.v1.HeartbeatRequest.shards:type_name -> doki.coordinator.v1.ShardHeartbeat
-	12, // 1: doki.coordinator.v1.GetShardMapResponse.shard_map:type_name -> doki.common.v1.ShardMap
-	8,  // 2: doki.coordinator.v1.GetStatusResponse.nodes:type_name -> doki.coordinator.v1.NodeHealthEntry
-	13, // 3: doki.coordinator.v1.GetStatusResponse.shards:type_name -> doki.common.v1.ShardInfo
-	1,  // 4: doki.coordinator.v1.CoordinatorService.Heartbeat:input_type -> doki.coordinator.v1.HeartbeatRequest
-	3,  // 5: doki.coordinator.v1.CoordinatorService.GetShardMap:input_type -> doki.coordinator.v1.GetShardMapRequest
-	5,  // 6: doki.coordinator.v1.CoordinatorService.WhereIsLeader:input_type -> doki.coordinator.v1.WhereIsLeaderRequest
-	7,  // 7: doki.coordinator.v1.CoordinatorService.GetStatus:input_type -> doki.coordinator.v1.GetStatusRequest
-	10, // 8: doki.coordinator.v1.CoordinatorService.NotifyLeader:input_type -> doki.coordinator.v1.NotifyLeaderRequest
-	2,  // 9: doki.coordinator.v1.CoordinatorService.Heartbeat:output_type -> doki.coordinator.v1.HeartbeatResponse
-	4,  // 10: doki.coordinator.v1.CoordinatorService.GetShardMap:output_type -> doki.coordinator.v1.GetShardMapResponse
-	6,  // 11: doki.coordinator.v1.CoordinatorService.WhereIsLeader:output_type -> doki.coordinator.v1.WhereIsLeaderResponse
-	9,  // 12: doki.coordinator.v1.CoordinatorService.GetStatus:output_type -> doki.coordinator.v1.GetStatusResponse
-	11, // 13: doki.coordinator.v1.CoordinatorService.NotifyLeader:output_type -> doki.coordinator.v1.NotifyLeaderResponse
-	9,  // [9:14] is the sub-list for method output_type
-	4,  // [4:9] is the sub-list for method input_type
-	4,  // [4:4] is the sub-list for extension type_name
-	4,  // [4:4] is the sub-list for extension extendee
-	0,  // [0:4] is the sub-list for field type_name
+	13, // 1: doki.coordinator.v1.GetShardMapResponse.shard_map:type_name -> doki.common.v1.ShardMap
+	12, // 2: doki.coordinator.v1.GetShardMapResponse.node_addresses:type_name -> doki.coordinator.v1.GetShardMapResponse.NodeAddressesEntry
+	8,  // 3: doki.coordinator.v1.GetStatusResponse.nodes:type_name -> doki.coordinator.v1.NodeHealthEntry
+	14, // 4: doki.coordinator.v1.GetStatusResponse.shards:type_name -> doki.common.v1.ShardInfo
+	1,  // 5: doki.coordinator.v1.CoordinatorService.Heartbeat:input_type -> doki.coordinator.v1.HeartbeatRequest
+	3,  // 6: doki.coordinator.v1.CoordinatorService.GetShardMap:input_type -> doki.coordinator.v1.GetShardMapRequest
+	5,  // 7: doki.coordinator.v1.CoordinatorService.WhereIsLeader:input_type -> doki.coordinator.v1.WhereIsLeaderRequest
+	7,  // 8: doki.coordinator.v1.CoordinatorService.GetStatus:input_type -> doki.coordinator.v1.GetStatusRequest
+	10, // 9: doki.coordinator.v1.CoordinatorService.NotifyLeader:input_type -> doki.coordinator.v1.NotifyLeaderRequest
+	2,  // 10: doki.coordinator.v1.CoordinatorService.Heartbeat:output_type -> doki.coordinator.v1.HeartbeatResponse
+	4,  // 11: doki.coordinator.v1.CoordinatorService.GetShardMap:output_type -> doki.coordinator.v1.GetShardMapResponse
+	6,  // 12: doki.coordinator.v1.CoordinatorService.WhereIsLeader:output_type -> doki.coordinator.v1.WhereIsLeaderResponse
+	9,  // 13: doki.coordinator.v1.CoordinatorService.GetStatus:output_type -> doki.coordinator.v1.GetStatusResponse
+	11, // 14: doki.coordinator.v1.CoordinatorService.NotifyLeader:output_type -> doki.coordinator.v1.NotifyLeaderResponse
+	10, // [10:15] is the sub-list for method output_type
+	5,  // [5:10] is the sub-list for method input_type
+	5,  // [5:5] is the sub-list for extension type_name
+	5,  // [5:5] is the sub-list for extension extendee
+	0,  // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_doki_coordinator_v1_coordinator_proto_init() }
@@ -748,7 +780,7 @@ func file_doki_coordinator_v1_coordinator_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_doki_coordinator_v1_coordinator_proto_rawDesc), len(file_doki_coordinator_v1_coordinator_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   12,
+			NumMessages:   13,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

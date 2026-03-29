@@ -952,6 +952,238 @@ func (*ForceRecoverResponse) Descriptor() ([]byte, []int) {
 	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{12}
 }
 
+type VoteRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	CandidateId   string                 `protobuf:"bytes,2,opt,name=candidate_id,json=candidateId,proto3" json:"candidate_id,omitempty"`
+	Version       uint64                 `protobuf:"varint,3,opt,name=version,proto3" json:"version,omitempty"`
+	ShardId       string                 `protobuf:"bytes,4,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VoteRequest) Reset() {
+	*x = VoteRequest{}
+	mi := &file_doki_node_v1_node_proto_msgTypes[13]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VoteRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VoteRequest) ProtoMessage() {}
+
+func (x *VoteRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_doki_node_v1_node_proto_msgTypes[13]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VoteRequest.ProtoReflect.Descriptor instead.
+func (*VoteRequest) Descriptor() ([]byte, []int) {
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{13}
+}
+
+func (x *VoteRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *VoteRequest) GetCandidateId() string {
+	if x != nil {
+		return x.CandidateId
+	}
+	return ""
+}
+
+func (x *VoteRequest) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *VoteRequest) GetShardId() string {
+	if x != nil {
+		return x.ShardId
+	}
+	return ""
+}
+
+type VoteResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	VoteGranted   bool                   `protobuf:"varint,2,opt,name=vote_granted,json=voteGranted,proto3" json:"vote_granted,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *VoteResponse) Reset() {
+	*x = VoteResponse{}
+	mi := &file_doki_node_v1_node_proto_msgTypes[14]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *VoteResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*VoteResponse) ProtoMessage() {}
+
+func (x *VoteResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_doki_node_v1_node_proto_msgTypes[14]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use VoteResponse.ProtoReflect.Descriptor instead.
+func (*VoteResponse) Descriptor() ([]byte, []int) {
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{14}
+}
+
+func (x *VoteResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *VoteResponse) GetVoteGranted() bool {
+	if x != nil {
+		return x.VoteGranted
+	}
+	return false
+}
+
+type LeaderHeartbeatRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	Version       uint64                 `protobuf:"varint,2,opt,name=version,proto3" json:"version,omitempty"`
+	LeaderId      string                 `protobuf:"bytes,3,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	ShardId       string                 `protobuf:"bytes,4,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LeaderHeartbeatRequest) Reset() {
+	*x = LeaderHeartbeatRequest{}
+	mi := &file_doki_node_v1_node_proto_msgTypes[15]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LeaderHeartbeatRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LeaderHeartbeatRequest) ProtoMessage() {}
+
+func (x *LeaderHeartbeatRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_doki_node_v1_node_proto_msgTypes[15]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LeaderHeartbeatRequest.ProtoReflect.Descriptor instead.
+func (*LeaderHeartbeatRequest) Descriptor() ([]byte, []int) {
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{15}
+}
+
+func (x *LeaderHeartbeatRequest) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
+func (x *LeaderHeartbeatRequest) GetVersion() uint64 {
+	if x != nil {
+		return x.Version
+	}
+	return 0
+}
+
+func (x *LeaderHeartbeatRequest) GetLeaderId() string {
+	if x != nil {
+		return x.LeaderId
+	}
+	return ""
+}
+
+func (x *LeaderHeartbeatRequest) GetShardId() string {
+	if x != nil {
+		return x.ShardId
+	}
+	return ""
+}
+
+type LeaderHeartbeatResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Term          uint64                 `protobuf:"varint,1,opt,name=term,proto3" json:"term,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *LeaderHeartbeatResponse) Reset() {
+	*x = LeaderHeartbeatResponse{}
+	mi := &file_doki_node_v1_node_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *LeaderHeartbeatResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*LeaderHeartbeatResponse) ProtoMessage() {}
+
+func (x *LeaderHeartbeatResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_doki_node_v1_node_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use LeaderHeartbeatResponse.ProtoReflect.Descriptor instead.
+func (*LeaderHeartbeatResponse) Descriptor() ([]byte, []int) {
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *LeaderHeartbeatResponse) GetTerm() uint64 {
+	if x != nil {
+		return x.Term
+	}
+	return 0
+}
+
 type SyncStateRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ShardId       string                 `protobuf:"bytes,1,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
@@ -961,7 +1193,7 @@ type SyncStateRequest struct {
 
 func (x *SyncStateRequest) Reset() {
 	*x = SyncStateRequest{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[13]
+	mi := &file_doki_node_v1_node_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -973,7 +1205,7 @@ func (x *SyncStateRequest) String() string {
 func (*SyncStateRequest) ProtoMessage() {}
 
 func (x *SyncStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[13]
+	mi := &file_doki_node_v1_node_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -986,7 +1218,7 @@ func (x *SyncStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncStateRequest.ProtoReflect.Descriptor instead.
 func (*SyncStateRequest) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{13}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *SyncStateRequest) GetShardId() string {
@@ -1012,7 +1244,7 @@ type SyncStateResponse struct {
 
 func (x *SyncStateResponse) Reset() {
 	*x = SyncStateResponse{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[14]
+	mi := &file_doki_node_v1_node_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1024,7 +1256,7 @@ func (x *SyncStateResponse) String() string {
 func (*SyncStateResponse) ProtoMessage() {}
 
 func (x *SyncStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[14]
+	mi := &file_doki_node_v1_node_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1037,7 +1269,7 @@ func (x *SyncStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SyncStateResponse.ProtoReflect.Descriptor instead.
 func (*SyncStateResponse) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{14}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *SyncStateResponse) GetShardId() string {
@@ -1092,7 +1324,7 @@ type AssignLeaderRequest struct {
 
 func (x *AssignLeaderRequest) Reset() {
 	*x = AssignLeaderRequest{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[15]
+	mi := &file_doki_node_v1_node_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1104,7 +1336,7 @@ func (x *AssignLeaderRequest) String() string {
 func (*AssignLeaderRequest) ProtoMessage() {}
 
 func (x *AssignLeaderRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[15]
+	mi := &file_doki_node_v1_node_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1117,7 +1349,7 @@ func (x *AssignLeaderRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AssignLeaderRequest.ProtoReflect.Descriptor instead.
 func (*AssignLeaderRequest) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{15}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *AssignLeaderRequest) GetShardId() string {
@@ -1142,7 +1374,7 @@ type AssignLeaderResponse struct {
 
 func (x *AssignLeaderResponse) Reset() {
 	*x = AssignLeaderResponse{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[16]
+	mi := &file_doki_node_v1_node_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1154,7 +1386,7 @@ func (x *AssignLeaderResponse) String() string {
 func (*AssignLeaderResponse) ProtoMessage() {}
 
 func (x *AssignLeaderResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[16]
+	mi := &file_doki_node_v1_node_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1167,7 +1399,7 @@ func (x *AssignLeaderResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AssignLeaderResponse.ProtoReflect.Descriptor instead.
 func (*AssignLeaderResponse) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{16}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{20}
 }
 
 type SetFollowerRequest struct {
@@ -1181,7 +1413,7 @@ type SetFollowerRequest struct {
 
 func (x *SetFollowerRequest) Reset() {
 	*x = SetFollowerRequest{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[17]
+	mi := &file_doki_node_v1_node_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1193,7 +1425,7 @@ func (x *SetFollowerRequest) String() string {
 func (*SetFollowerRequest) ProtoMessage() {}
 
 func (x *SetFollowerRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[17]
+	mi := &file_doki_node_v1_node_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1206,7 +1438,7 @@ func (x *SetFollowerRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetFollowerRequest.ProtoReflect.Descriptor instead.
 func (*SetFollowerRequest) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{17}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *SetFollowerRequest) GetShardId() string {
@@ -1238,7 +1470,7 @@ type SetFollowerResponse struct {
 
 func (x *SetFollowerResponse) Reset() {
 	*x = SetFollowerResponse{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[18]
+	mi := &file_doki_node_v1_node_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1250,7 +1482,7 @@ func (x *SetFollowerResponse) String() string {
 func (*SetFollowerResponse) ProtoMessage() {}
 
 func (x *SetFollowerResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[18]
+	mi := &file_doki_node_v1_node_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1263,7 +1495,7 @@ func (x *SetFollowerResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use SetFollowerResponse.ProtoReflect.Descriptor instead.
 func (*SetFollowerResponse) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{18}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{22}
 }
 
 type GetStatusRequest struct {
@@ -1274,7 +1506,7 @@ type GetStatusRequest struct {
 
 func (x *GetStatusRequest) Reset() {
 	*x = GetStatusRequest{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[19]
+	mi := &file_doki_node_v1_node_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1286,7 +1518,7 @@ func (x *GetStatusRequest) String() string {
 func (*GetStatusRequest) ProtoMessage() {}
 
 func (x *GetStatusRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[19]
+	mi := &file_doki_node_v1_node_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1299,7 +1531,7 @@ func (x *GetStatusRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetStatusRequest.ProtoReflect.Descriptor instead.
 func (*GetStatusRequest) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{19}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{23}
 }
 
 type ShardStatus struct {
@@ -1317,7 +1549,7 @@ type ShardStatus struct {
 
 func (x *ShardStatus) Reset() {
 	*x = ShardStatus{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[20]
+	mi := &file_doki_node_v1_node_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1329,7 +1561,7 @@ func (x *ShardStatus) String() string {
 func (*ShardStatus) ProtoMessage() {}
 
 func (x *ShardStatus) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[20]
+	mi := &file_doki_node_v1_node_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1342,7 +1574,7 @@ func (x *ShardStatus) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ShardStatus.ProtoReflect.Descriptor instead.
 func (*ShardStatus) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{20}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *ShardStatus) GetShardId() string {
@@ -1405,7 +1637,7 @@ type GetStatusResponse struct {
 
 func (x *GetStatusResponse) Reset() {
 	*x = GetStatusResponse{}
-	mi := &file_doki_node_v1_node_proto_msgTypes[21]
+	mi := &file_doki_node_v1_node_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1417,7 +1649,7 @@ func (x *GetStatusResponse) String() string {
 func (*GetStatusResponse) ProtoMessage() {}
 
 func (x *GetStatusResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_doki_node_v1_node_proto_msgTypes[21]
+	mi := &file_doki_node_v1_node_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1430,7 +1662,7 @@ func (x *GetStatusResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetStatusResponse.ProtoReflect.Descriptor instead.
 func (*GetStatusResponse) Descriptor() ([]byte, []int) {
-	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{21}
+	return file_doki_node_v1_node_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *GetStatusResponse) GetNodeId() string {
@@ -1529,7 +1761,22 @@ const file_doki_node_v1_node_proto_rawDesc = "" +
 	"\rTYPE_SNAPSHOT\x10\x02\"0\n" +
 	"\x13ForceRecoverRequest\x12\x19\n" +
 	"\bshard_id\x18\x01 \x01(\tR\ashardId\"\x16\n" +
-	"\x14ForceRecoverResponse\"-\n" +
+	"\x14ForceRecoverResponse\"y\n" +
+	"\vVoteRequest\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
+	"\fcandidate_id\x18\x02 \x01(\tR\vcandidateId\x12\x18\n" +
+	"\aversion\x18\x03 \x01(\x04R\aversion\x12\x19\n" +
+	"\bshard_id\x18\x04 \x01(\tR\ashardId\"E\n" +
+	"\fVoteResponse\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12!\n" +
+	"\fvote_granted\x18\x02 \x01(\bR\vvoteGranted\"~\n" +
+	"\x16LeaderHeartbeatRequest\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\x12\x18\n" +
+	"\aversion\x18\x02 \x01(\x04R\aversion\x12\x1b\n" +
+	"\tleader_id\x18\x03 \x01(\tR\bleaderId\x12\x19\n" +
+	"\bshard_id\x18\x04 \x01(\tR\ashardId\"-\n" +
+	"\x17LeaderHeartbeatResponse\x12\x12\n" +
+	"\x04term\x18\x01 \x01(\x04R\x04term\"-\n" +
 	"\x10SyncStateRequest\x12\x19\n" +
 	"\bshard_id\x18\x01 \x01(\tR\ashardId\"\xd4\x01\n" +
 	"\x11SyncStateResponse\x12\x19\n" +
@@ -1564,14 +1811,16 @@ const file_doki_node_v1_node_proto_rawDesc = "" +
 	"\x11GetStatusResponse\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12%\n" +
 	"\x0euptime_seconds\x18\x02 \x01(\x01R\ruptimeSeconds\x121\n" +
-	"\x06shards\x18\x03 \x03(\v2\x19.doki.node.v1.ShardStatusR\x06shards2\x80\x06\n" +
+	"\x06shards\x18\x03 \x03(\v2\x19.doki.node.v1.ShardStatusR\x06shards2\xa6\a\n" +
 	"\vNodeService\x12:\n" +
 	"\x03Put\x12\x18.doki.node.v1.PutRequest\x1a\x19.doki.node.v1.PutResponse\x12:\n" +
 	"\x03Get\x12\x18.doki.node.v1.GetRequest\x1a\x19.doki.node.v1.GetResponse\x12C\n" +
 	"\x06Delete\x12\x1b.doki.node.v1.DeleteRequest\x1a\x1c.doki.node.v1.DeleteResponse\x12L\n" +
 	"\tReplicate\x12\x1e.doki.node.v1.ReplicateRequest\x1a\x1f.doki.node.v1.ReplicateResponse\x12F\n" +
 	"\aRecover\x12\x1c.doki.node.v1.RecoverRequest\x1a\x1d.doki.node.v1.RecoverResponse\x12U\n" +
-	"\fForceRecover\x12!.doki.node.v1.ForceRecoverRequest\x1a\".doki.node.v1.ForceRecoverResponse\x12N\n" +
+	"\fForceRecover\x12!.doki.node.v1.ForceRecoverRequest\x1a\".doki.node.v1.ForceRecoverResponse\x12D\n" +
+	"\vRequestVote\x12\x19.doki.node.v1.VoteRequest\x1a\x1a.doki.node.v1.VoteResponse\x12^\n" +
+	"\x0fLeaderHeartbeat\x12$.doki.node.v1.LeaderHeartbeatRequest\x1a%.doki.node.v1.LeaderHeartbeatResponse\x12N\n" +
 	"\tSyncState\x12\x1e.doki.node.v1.SyncStateRequest\x1a\x1f.doki.node.v1.SyncStateResponse0\x01\x12U\n" +
 	"\fAssignLeader\x12!.doki.node.v1.AssignLeaderRequest\x1a\".doki.node.v1.AssignLeaderResponse\x12R\n" +
 	"\vSetFollower\x12 .doki.node.v1.SetFollowerRequest\x1a!.doki.node.v1.SetFollowerResponse\x12L\n" +
@@ -1590,72 +1839,80 @@ func file_doki_node_v1_node_proto_rawDescGZIP() []byte {
 }
 
 var file_doki_node_v1_node_proto_enumTypes = make([]protoimpl.EnumInfo, 4)
-var file_doki_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 23)
+var file_doki_node_v1_node_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_doki_node_v1_node_proto_goTypes = []any{
-	(PutResponse_Result)(0),      // 0: doki.node.v1.PutResponse.Result
-	(GetResponse_Result)(0),      // 1: doki.node.v1.GetResponse.Result
-	(DeleteResponse_Result)(0),   // 2: doki.node.v1.DeleteResponse.Result
-	(RecoverResponse_Type)(0),    // 3: doki.node.v1.RecoverResponse.Type
-	(*PutRequest)(nil),           // 4: doki.node.v1.PutRequest
-	(*PutResponse)(nil),          // 5: doki.node.v1.PutResponse
-	(*GetRequest)(nil),           // 6: doki.node.v1.GetRequest
-	(*GetResponse)(nil),          // 7: doki.node.v1.GetResponse
-	(*DeleteRequest)(nil),        // 8: doki.node.v1.DeleteRequest
-	(*DeleteResponse)(nil),       // 9: doki.node.v1.DeleteResponse
-	(*ReplicateRequest)(nil),     // 10: doki.node.v1.ReplicateRequest
-	(*ReplicateResponse)(nil),    // 11: doki.node.v1.ReplicateResponse
-	(*LogEntry)(nil),             // 12: doki.node.v1.LogEntry
-	(*RecoverRequest)(nil),       // 13: doki.node.v1.RecoverRequest
-	(*RecoverResponse)(nil),      // 14: doki.node.v1.RecoverResponse
-	(*ForceRecoverRequest)(nil),  // 15: doki.node.v1.ForceRecoverRequest
-	(*ForceRecoverResponse)(nil), // 16: doki.node.v1.ForceRecoverResponse
-	(*SyncStateRequest)(nil),     // 17: doki.node.v1.SyncStateRequest
-	(*SyncStateResponse)(nil),    // 18: doki.node.v1.SyncStateResponse
-	(*AssignLeaderRequest)(nil),  // 19: doki.node.v1.AssignLeaderRequest
-	(*AssignLeaderResponse)(nil), // 20: doki.node.v1.AssignLeaderResponse
-	(*SetFollowerRequest)(nil),   // 21: doki.node.v1.SetFollowerRequest
-	(*SetFollowerResponse)(nil),  // 22: doki.node.v1.SetFollowerResponse
-	(*GetStatusRequest)(nil),     // 23: doki.node.v1.GetStatusRequest
-	(*ShardStatus)(nil),          // 24: doki.node.v1.ShardStatus
-	(*GetStatusResponse)(nil),    // 25: doki.node.v1.GetStatusResponse
-	nil,                          // 26: doki.node.v1.ShardStatus.PeerVersionsEntry
-	(*v1.Operation)(nil),         // 27: doki.common.v1.Operation
-	(*v1.KVEntry)(nil),           // 28: doki.common.v1.KVEntry
+	(PutResponse_Result)(0),         // 0: doki.node.v1.PutResponse.Result
+	(GetResponse_Result)(0),         // 1: doki.node.v1.GetResponse.Result
+	(DeleteResponse_Result)(0),      // 2: doki.node.v1.DeleteResponse.Result
+	(RecoverResponse_Type)(0),       // 3: doki.node.v1.RecoverResponse.Type
+	(*PutRequest)(nil),              // 4: doki.node.v1.PutRequest
+	(*PutResponse)(nil),             // 5: doki.node.v1.PutResponse
+	(*GetRequest)(nil),              // 6: doki.node.v1.GetRequest
+	(*GetResponse)(nil),             // 7: doki.node.v1.GetResponse
+	(*DeleteRequest)(nil),           // 8: doki.node.v1.DeleteRequest
+	(*DeleteResponse)(nil),          // 9: doki.node.v1.DeleteResponse
+	(*ReplicateRequest)(nil),        // 10: doki.node.v1.ReplicateRequest
+	(*ReplicateResponse)(nil),       // 11: doki.node.v1.ReplicateResponse
+	(*LogEntry)(nil),                // 12: doki.node.v1.LogEntry
+	(*RecoverRequest)(nil),          // 13: doki.node.v1.RecoverRequest
+	(*RecoverResponse)(nil),         // 14: doki.node.v1.RecoverResponse
+	(*ForceRecoverRequest)(nil),     // 15: doki.node.v1.ForceRecoverRequest
+	(*ForceRecoverResponse)(nil),    // 16: doki.node.v1.ForceRecoverResponse
+	(*VoteRequest)(nil),             // 17: doki.node.v1.VoteRequest
+	(*VoteResponse)(nil),            // 18: doki.node.v1.VoteResponse
+	(*LeaderHeartbeatRequest)(nil),  // 19: doki.node.v1.LeaderHeartbeatRequest
+	(*LeaderHeartbeatResponse)(nil), // 20: doki.node.v1.LeaderHeartbeatResponse
+	(*SyncStateRequest)(nil),        // 21: doki.node.v1.SyncStateRequest
+	(*SyncStateResponse)(nil),       // 22: doki.node.v1.SyncStateResponse
+	(*AssignLeaderRequest)(nil),     // 23: doki.node.v1.AssignLeaderRequest
+	(*AssignLeaderResponse)(nil),    // 24: doki.node.v1.AssignLeaderResponse
+	(*SetFollowerRequest)(nil),      // 25: doki.node.v1.SetFollowerRequest
+	(*SetFollowerResponse)(nil),     // 26: doki.node.v1.SetFollowerResponse
+	(*GetStatusRequest)(nil),        // 27: doki.node.v1.GetStatusRequest
+	(*ShardStatus)(nil),             // 28: doki.node.v1.ShardStatus
+	(*GetStatusResponse)(nil),       // 29: doki.node.v1.GetStatusResponse
+	nil,                             // 30: doki.node.v1.ShardStatus.PeerVersionsEntry
+	(*v1.Operation)(nil),            // 31: doki.common.v1.Operation
+	(*v1.KVEntry)(nil),              // 32: doki.common.v1.KVEntry
 }
 var file_doki_node_v1_node_proto_depIdxs = []int32{
 	0,  // 0: doki.node.v1.PutResponse.result:type_name -> doki.node.v1.PutResponse.Result
 	1,  // 1: doki.node.v1.GetResponse.result:type_name -> doki.node.v1.GetResponse.Result
 	2,  // 2: doki.node.v1.DeleteResponse.result:type_name -> doki.node.v1.DeleteResponse.Result
-	27, // 3: doki.node.v1.ReplicateRequest.op:type_name -> doki.common.v1.Operation
-	27, // 4: doki.node.v1.LogEntry.op:type_name -> doki.common.v1.Operation
+	31, // 3: doki.node.v1.ReplicateRequest.op:type_name -> doki.common.v1.Operation
+	31, // 4: doki.node.v1.LogEntry.op:type_name -> doki.common.v1.Operation
 	3,  // 5: doki.node.v1.RecoverResponse.type:type_name -> doki.node.v1.RecoverResponse.Type
 	12, // 6: doki.node.v1.RecoverResponse.entries:type_name -> doki.node.v1.LogEntry
-	28, // 7: doki.node.v1.RecoverResponse.kv:type_name -> doki.common.v1.KVEntry
-	28, // 8: doki.node.v1.SyncStateResponse.entries:type_name -> doki.common.v1.KVEntry
-	26, // 9: doki.node.v1.ShardStatus.peer_versions:type_name -> doki.node.v1.ShardStatus.PeerVersionsEntry
-	24, // 10: doki.node.v1.GetStatusResponse.shards:type_name -> doki.node.v1.ShardStatus
+	32, // 7: doki.node.v1.RecoverResponse.kv:type_name -> doki.common.v1.KVEntry
+	32, // 8: doki.node.v1.SyncStateResponse.entries:type_name -> doki.common.v1.KVEntry
+	30, // 9: doki.node.v1.ShardStatus.peer_versions:type_name -> doki.node.v1.ShardStatus.PeerVersionsEntry
+	28, // 10: doki.node.v1.GetStatusResponse.shards:type_name -> doki.node.v1.ShardStatus
 	4,  // 11: doki.node.v1.NodeService.Put:input_type -> doki.node.v1.PutRequest
 	6,  // 12: doki.node.v1.NodeService.Get:input_type -> doki.node.v1.GetRequest
 	8,  // 13: doki.node.v1.NodeService.Delete:input_type -> doki.node.v1.DeleteRequest
 	10, // 14: doki.node.v1.NodeService.Replicate:input_type -> doki.node.v1.ReplicateRequest
 	13, // 15: doki.node.v1.NodeService.Recover:input_type -> doki.node.v1.RecoverRequest
 	15, // 16: doki.node.v1.NodeService.ForceRecover:input_type -> doki.node.v1.ForceRecoverRequest
-	17, // 17: doki.node.v1.NodeService.SyncState:input_type -> doki.node.v1.SyncStateRequest
-	19, // 18: doki.node.v1.NodeService.AssignLeader:input_type -> doki.node.v1.AssignLeaderRequest
-	21, // 19: doki.node.v1.NodeService.SetFollower:input_type -> doki.node.v1.SetFollowerRequest
-	23, // 20: doki.node.v1.NodeService.GetStatus:input_type -> doki.node.v1.GetStatusRequest
-	5,  // 21: doki.node.v1.NodeService.Put:output_type -> doki.node.v1.PutResponse
-	7,  // 22: doki.node.v1.NodeService.Get:output_type -> doki.node.v1.GetResponse
-	9,  // 23: doki.node.v1.NodeService.Delete:output_type -> doki.node.v1.DeleteResponse
-	11, // 24: doki.node.v1.NodeService.Replicate:output_type -> doki.node.v1.ReplicateResponse
-	14, // 25: doki.node.v1.NodeService.Recover:output_type -> doki.node.v1.RecoverResponse
-	16, // 26: doki.node.v1.NodeService.ForceRecover:output_type -> doki.node.v1.ForceRecoverResponse
-	18, // 27: doki.node.v1.NodeService.SyncState:output_type -> doki.node.v1.SyncStateResponse
-	20, // 28: doki.node.v1.NodeService.AssignLeader:output_type -> doki.node.v1.AssignLeaderResponse
-	22, // 29: doki.node.v1.NodeService.SetFollower:output_type -> doki.node.v1.SetFollowerResponse
-	25, // 30: doki.node.v1.NodeService.GetStatus:output_type -> doki.node.v1.GetStatusResponse
-	21, // [21:31] is the sub-list for method output_type
-	11, // [11:21] is the sub-list for method input_type
+	17, // 17: doki.node.v1.NodeService.RequestVote:input_type -> doki.node.v1.VoteRequest
+	19, // 18: doki.node.v1.NodeService.LeaderHeartbeat:input_type -> doki.node.v1.LeaderHeartbeatRequest
+	21, // 19: doki.node.v1.NodeService.SyncState:input_type -> doki.node.v1.SyncStateRequest
+	23, // 20: doki.node.v1.NodeService.AssignLeader:input_type -> doki.node.v1.AssignLeaderRequest
+	25, // 21: doki.node.v1.NodeService.SetFollower:input_type -> doki.node.v1.SetFollowerRequest
+	27, // 22: doki.node.v1.NodeService.GetStatus:input_type -> doki.node.v1.GetStatusRequest
+	5,  // 23: doki.node.v1.NodeService.Put:output_type -> doki.node.v1.PutResponse
+	7,  // 24: doki.node.v1.NodeService.Get:output_type -> doki.node.v1.GetResponse
+	9,  // 25: doki.node.v1.NodeService.Delete:output_type -> doki.node.v1.DeleteResponse
+	11, // 26: doki.node.v1.NodeService.Replicate:output_type -> doki.node.v1.ReplicateResponse
+	14, // 27: doki.node.v1.NodeService.Recover:output_type -> doki.node.v1.RecoverResponse
+	16, // 28: doki.node.v1.NodeService.ForceRecover:output_type -> doki.node.v1.ForceRecoverResponse
+	18, // 29: doki.node.v1.NodeService.RequestVote:output_type -> doki.node.v1.VoteResponse
+	20, // 30: doki.node.v1.NodeService.LeaderHeartbeat:output_type -> doki.node.v1.LeaderHeartbeatResponse
+	22, // 31: doki.node.v1.NodeService.SyncState:output_type -> doki.node.v1.SyncStateResponse
+	24, // 32: doki.node.v1.NodeService.AssignLeader:output_type -> doki.node.v1.AssignLeaderResponse
+	26, // 33: doki.node.v1.NodeService.SetFollower:output_type -> doki.node.v1.SetFollowerResponse
+	29, // 34: doki.node.v1.NodeService.GetStatus:output_type -> doki.node.v1.GetStatusResponse
+	23, // [23:35] is the sub-list for method output_type
+	11, // [11:23] is the sub-list for method input_type
 	11, // [11:11] is the sub-list for extension type_name
 	11, // [11:11] is the sub-list for extension extendee
 	0,  // [0:11] is the sub-list for field type_name
@@ -1672,7 +1929,7 @@ func file_doki_node_v1_node_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_doki_node_v1_node_proto_rawDesc), len(file_doki_node_v1_node_proto_rawDesc)),
 			NumEnums:      4,
-			NumMessages:   23,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

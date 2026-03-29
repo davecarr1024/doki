@@ -20,14 +20,17 @@ package node
 //   - Receiving a message with a higher term immediately demotes the node.
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
 	"log"
 	"math/rand"
 	"net/http"
 	"time"
+
+	coordinatorv1 "github.com/davecarr1024/doki/gen/doki/coordinator/v1"
+	nodev1 "github.com/davecarr1024/doki/gen/doki/node/v1"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // --- Types ---
@@ -249,31 +252,24 @@ func (s *Server) startElection(ctx context.Context, replica *ReplicaState) {
 
 // sendVoteRequest sends a single RequestVote RPC and returns (granted, peerTerm).
 func sendVoteRequest(ctx context.Context, peerAddr, shardID string, req VoteRequest, timeout time.Duration) (bool, uint64) {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return false, 0
-	}
-	url := fmt.Sprintf("http://%s/internal/request_vote/%s", peerAddr, shardID)
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
+	conn, err := grpc.DialContext(reqCtx, peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
 		return false, 0
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(httpReq)
+	defer func() { _ = conn.Close() }()
+	client := nodev1.NewNodeServiceClient(conn)
+	resp, err := client.RequestVote(reqCtx, &nodev1.VoteRequest{
+		Term:        req.Term,
+		CandidateId: req.CandidateID,
+		Version:     req.Version,
+		ShardId:     shardID,
+	})
 	if err != nil {
 		return false, 0
 	}
-	defer func() { _ = resp.Body.Close() }()
-	if resp.StatusCode != http.StatusOK {
-		return false, 0
-	}
-	var vr VoteResponse
-	if err := json.NewDecoder(resp.Body).Decode(&vr); err != nil {
-		return false, 0
-	}
-	return vr.VoteGranted, vr.Term
+	return resp.VoteGranted, resp.Term
 }
 
 // notifyCoordinatorElection informs the coordinator that this node won an
@@ -281,16 +277,6 @@ func sendVoteRequest(ctx context.Context, peerAddr, shardID string, req VoteRequ
 // even if notification fails — nodes refetch the shard map on the next
 // coordinator heartbeat cycle. ctx controls retry cancellation.
 func (s *Server) notifyCoordinatorElection(ctx context.Context, shardID, leaderID string, term uint64) {
-	type notifyReq struct {
-		ShardID  string `json:"shard_id"`
-		LeaderID string `json:"leader_id"`
-		Term     uint64 `json:"term"`
-	}
-	body, err := json.Marshal(notifyReq{ShardID: shardID, LeaderID: leaderID, Term: term})
-	if err != nil {
-		return
-	}
-	url := "http://" + s.cfg.CoordinatorAddress + "/notify_leader"
 	backoff := 500 * time.Millisecond
 	for attempt := 0; attempt < 4; attempt++ {
 		if attempt > 0 {
@@ -302,25 +288,29 @@ func (s *Server) notifyCoordinatorElection(ctx context.Context, shardID, leaderI
 			backoff *= 2
 		}
 		reqCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
+		conn, client, err := s.dialCoordinator(reqCtx, 2*time.Second)
 		if err != nil {
 			cancel()
-			return
+			log.Printf("notify_leader dial failed shard_id=%s attempt=%d err=%v", shardID, attempt, err)
+			continue
 		}
-		httpReq.Header.Set("Content-Type", "application/json")
-		resp, err := http.DefaultClient.Do(httpReq)
+		resp, err := client.NotifyLeader(reqCtx, &coordinatorv1.NotifyLeaderRequest{
+			ShardId:  shardID,
+			LeaderId: leaderID,
+			Term:     term,
+		})
+		_ = conn.Close()
 		cancel()
 		if err != nil {
 			log.Printf("notify_leader failed shard_id=%s attempt=%d err=%v", shardID, attempt, err)
 			continue
 		}
-		_ = resp.Body.Close()
-		if resp.StatusCode == http.StatusOK {
+		if resp.Accepted {
 			log.Printf("coordinator notified of election shard_id=%s leader=%s term=%d", shardID, leaderID, term)
 			return
 		}
-		log.Printf("notify_leader rejected shard_id=%s status=%d", shardID, resp.StatusCode)
-		return // non-retryable rejection (e.g. stale term)
+		log.Printf("notify_leader rejected shard_id=%s current_term=%d", shardID, resp.CurrentTerm)
+		return
 	}
 }
 
@@ -407,28 +397,24 @@ func (s *Server) runLeaderHeartbeat(ctx context.Context, replica *ReplicaState) 
 // sendLeaderHeartbeat sends one leader heartbeat to a peer.
 // Returns the peer's current term (0 on error).
 func sendLeaderHeartbeat(ctx context.Context, peerAddr, shardID string, req LeaderHeartbeatRequest, timeout time.Duration) uint64 {
-	body, err := json.Marshal(req)
-	if err != nil {
-		return 0
-	}
-	url := fmt.Sprintf("http://%s/internal/leader_heartbeat/%s", peerAddr, shardID)
 	reqCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, bytes.NewReader(body))
+	conn, err := grpc.DialContext(reqCtx, peerAddr, grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithBlock())
 	if err != nil {
 		return 0
 	}
-	httpReq.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(httpReq)
+	defer func() { _ = conn.Close() }()
+	client := nodev1.NewNodeServiceClient(conn)
+	resp, err := client.LeaderHeartbeat(reqCtx, &nodev1.LeaderHeartbeatRequest{
+		Term:     req.Term,
+		Version:  req.Version,
+		LeaderId: req.LeaderID,
+		ShardId:  shardID,
+	})
 	if err != nil {
 		return 0
 	}
-	defer func() { _ = resp.Body.Close() }()
-	var hbResp LeaderHeartbeatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&hbResp); err != nil {
-		return 0
-	}
-	return hbResp.Term
+	return resp.Term
 }
 
 // --- HTTP handlers ---

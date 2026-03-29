@@ -1,9 +1,9 @@
 package node
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -13,12 +13,17 @@ import (
 	"time"
 
 	"github.com/davecarr1024/doki/coordinator"
+	coordinatorv1 "github.com/davecarr1024/doki/gen/doki/coordinator/v1"
+	nodev1 "github.com/davecarr1024/doki/gen/doki/node/v1"
 	"github.com/davecarr1024/doki/internal/clock"
 	"github.com/davecarr1024/doki/internal/config"
 	"github.com/davecarr1024/doki/internal/metrics"
 	"github.com/davecarr1024/doki/internal/replicationlog"
 	"github.com/davecarr1024/doki/internal/shardmap"
 	"github.com/davecarr1024/doki/internal/wal"
+	"github.com/soheilhy/cmux"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/reflection"
 )
 
 // Server is a leaf node's HTTP server.
@@ -69,6 +74,7 @@ type Server struct {
 	mu              sync.RWMutex
 	startedAt       time.Time
 	httpServer      *http.Server
+	grpcServer      *grpc.Server
 	// Phase 5: per-shard contexts allow individual shards to be stopped cleanly.
 	serverCtx   context.Context
 	cancelFuncs map[string]context.CancelFunc // shard_id → cancel
@@ -257,24 +263,11 @@ func shardDataDir(dataDir, shardID string) string {
 
 // Start begins serving HTTP and runs background goroutines.
 func (s *Server) Start(ctx context.Context) error {
-	mux := http.NewServeMux()
-	s.registerRoutes(mux)
-	s.httpServer = &http.Server{
-		Addr:    s.cfg.Node.Address,
-		Handler: mux,
+	l, err := net.Listen("tcp", s.cfg.Node.Address)
+	if err != nil {
+		return fmt.Errorf("node listen: %w", err)
 	}
-	s.startBackgroundJobs(ctx)
-	go func() {
-		<-ctx.Done()
-		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = s.httpServer.Shutdown(shutCtx)
-	}()
-	log.Printf("node listening node_id=%s address=%s", s.cfg.Node.ID, s.cfg.Node.Address)
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("node http server: %w", err)
-	}
-	return nil
+	return s.StartOnListener(ctx, l)
 }
 
 // StartOnListener starts the server on the provided net.Listener.
@@ -283,18 +276,47 @@ func (s *Server) StartOnListener(ctx context.Context, l net.Listener) error {
 	mux := http.NewServeMux()
 	s.registerRoutes(mux)
 	s.httpServer = &http.Server{Handler: mux}
+	s.grpcServer = grpc.NewServer()
+	nodev1.RegisterNodeServiceServer(s.grpcServer, &grpcServer{s: s})
+	reflection.Register(s.grpcServer)
+
+	m := cmux.New(l)
+	grpcL := m.Match(cmux.HTTP2())
+	httpL := m.Match(cmux.Any())
+
 	s.startBackgroundJobs(ctx)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.grpcServer.Serve(grpcL)
+	}()
+	go func() {
+		if err := s.httpServer.Serve(httpL); err != nil && err != http.ErrServerClosed {
+			errCh <- fmt.Errorf("node http server: %w", err)
+		}
+	}()
+	go func() {
+		if err := m.Serve(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errCh <- fmt.Errorf("node cmux: %w", err)
+		}
+	}()
+
 	go func() {
 		<-ctx.Done()
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		s.grpcServer.GracefulStop()
 		_ = s.httpServer.Shutdown(shutCtx)
+		_ = l.Close()
 	}()
+
 	log.Printf("node listening node_id=%s address=%s", s.cfg.Node.ID, l.Addr())
-	if err := s.httpServer.Serve(l); err != nil && err != http.ErrServerClosed {
-		return fmt.Errorf("node http server: %w", err)
+	select {
+	case err := <-errCh:
+		return err
+	case <-ctx.Done():
+		return nil
 	}
-	return nil
 }
 
 func (s *Server) startBackgroundJobs(ctx context.Context) {
@@ -384,16 +406,7 @@ func (s *Server) leaderAddrForReplica(r *ReplicaState) string {
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ready", s.handleReady)
-	mux.HandleFunc("POST /kv/{shard_id}", s.handleKV)
-	mux.HandleFunc("POST /internal/replicate/{shard_id}", s.handleReplicate)
-	mux.HandleFunc("GET /internal/sync/{shard_id}", s.handleSync)
-	mux.HandleFunc("GET /internal/recover/{shard_id}", s.handleRecover)
-	mux.HandleFunc("POST /internal/force_recover/{shard_id}", s.handleForceRecover)
-	// Phase 4: distributed election endpoints.
-	mux.HandleFunc("POST /internal/request_vote/{shard_id}", s.handleRequestVote)
-	mux.HandleFunc("POST /internal/leader_heartbeat/{shard_id}", s.handleLeaderHeartbeat)
 	// Reliability: Prometheus metrics.
 	mux.Handle("GET /metrics", s.m.Handler())
 }
@@ -948,32 +961,20 @@ func (s *Server) sendHeartbeat() {
 	}
 	s.mu.RUnlock()
 
-	req := coordinator.HeartbeatRequest{
-		NodeID: s.cfg.Node.ID,
-		Shards: shards,
-	}
-	body, err := json.Marshal(req)
+	conn, client, err := s.dialCoordinator(context.Background(), 2*time.Second)
 	if err != nil {
-		log.Printf("heartbeat marshal error node_id=%s err=%v", s.cfg.Node.ID, err)
+		log.Printf("heartbeat dial failed node_id=%s err=%v", s.cfg.Node.ID, err)
 		return
 	}
+	defer func() { _ = conn.Close() }()
 
-	url := "http://" + s.cfg.CoordinatorAddress + "/heartbeat"
-	resp, err := http.Post(url, "application/json", bytes.NewReader(body)) //nolint:noctx
+	req := &coordinatorv1.HeartbeatRequest{
+		NodeId: s.cfg.Node.ID,
+		Shards: shardHeartbeatsFromStatus(shards),
+	}
+	hbResp, err := client.Heartbeat(context.Background(), req)
 	if err != nil {
 		log.Printf("heartbeat failed node_id=%s err=%v", s.cfg.Node.ID, err)
-		return
-	}
-	defer func() { _ = resp.Body.Close() }()
-
-	if resp.StatusCode != http.StatusOK {
-		log.Printf("heartbeat rejected node_id=%s status=%d", s.cfg.Node.ID, resp.StatusCode)
-		return
-	}
-
-	// Check if coordinator's shard map version is newer; if so, refetch.
-	var hbResp coordinator.HeartbeatResponse
-	if err := json.NewDecoder(resp.Body).Decode(&hbResp); err != nil {
 		return
 	}
 	s.mu.RLock()
@@ -988,18 +989,19 @@ func (s *Server) sendHeartbeat() {
 // any leader or role changes to existing replicas. Phase 5: also detects
 // newly-assigned shards (calls initShardLocked) and removed shards (dropShard).
 func (s *Server) refetchShardMap() {
-	url := "http://" + s.cfg.CoordinatorAddress + "/shardmap"
-	resp, err := http.Get(url) //nolint:noctx
+	conn, client, err := s.dialCoordinator(context.Background(), 2*time.Second)
+	if err != nil {
+		log.Printf("shardmap dial failed node_id=%s err=%v", s.cfg.Node.ID, err)
+		return
+	}
+	defer func() { _ = conn.Close() }()
+
+	resp, err := client.GetShardMap(context.Background(), &coordinatorv1.GetShardMapRequest{})
 	if err != nil {
 		log.Printf("shardmap refetch failed node_id=%s err=%v", s.cfg.Node.ID, err)
 		return
 	}
-	defer func() { _ = resp.Body.Close() }()
-	var smResp coordinator.ShardMapResponse
-	if err := json.NewDecoder(resp.Body).Decode(&smResp); err != nil {
-		log.Printf("shardmap decode failed node_id=%s err=%v", s.cfg.Node.ID, err)
-		return
-	}
+	smResp := shardMapResponseFromProto(resp)
 
 	// Collect shard IDs this node should now host.
 	shouldHost := make(map[string]shardmap.ShardInfo, len(smResp.Shards))
