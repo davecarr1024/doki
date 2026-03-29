@@ -2,11 +2,15 @@ package node
 
 import (
 	"context"
+	"errors"
+	"fmt"
 
 	commonv1 "github.com/davecarr1024/doki/gen/doki/common/v1"
 	nodev1 "github.com/davecarr1024/doki/gen/doki/node/v1"
 	"github.com/davecarr1024/doki/internal/replicationlog"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -280,20 +284,27 @@ func (g *grpcServer) handleWrite(ctx context.Context, shardID, op, key, value st
 	if replica == nil {
 		return nil, status.Errorf(codes.NotFound, "shard not found")
 	}
-	snap := replica.StatusSnapshot()
-	if snap.Role != RoleLeader {
+	snap, err := ensureLeaderReady(replica)
+	if err != nil {
+		if errors.Is(err, errNotLeader) {
+			return &nodev1.PutResponse{
+				Result:     nodev1.PutResponse_RESULT_NOT_LEADER,
+				LeaderHint: snap.LeaderID,
+			}, nil
+		}
 		return &nodev1.PutResponse{
-			Result:     nodev1.PutResponse_RESULT_NOT_LEADER,
-			LeaderHint: snap.LeaderID,
+			Result: nodev1.PutResponse_RESULT_NOT_READY,
 		}, nil
 	}
-	if !snap.IsReady {
-		return &nodev1.PutResponse{Result: nodev1.PutResponse_RESULT_NOT_READY}, nil
-	}
-	if err := g.s.leaderWrite(ctx, replica, KVRequest{Op: op, Key: key, Value: value}); err != nil {
+	result, err := g.s.leaderWrite(ctx, replica, KVRequest{Op: op, Key: key, Value: value})
+	if err != nil {
 		g.s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 		return &nodev1.PutResponse{Result: nodev1.PutResponse_RESULT_QUORUM_UNAVAILABLE}, nil
 	}
+	_ = grpc.SetHeader(ctx, metadata.Pairs(
+		"x-doki-applied-version", fmt.Sprintf("%d", result.AppliedVersion),
+		"x-doki-quorum", fmt.Sprintf("%d", result.Quorum),
+	))
 	g.s.m.WritesTotal.WithLabelValues(shardID, "ok").Inc()
 	return &nodev1.PutResponse{Result: nodev1.PutResponse_RESULT_OK}, nil
 }

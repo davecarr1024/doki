@@ -378,6 +378,14 @@ The leader waits for quorum with a configurable timeout (default: 1 second). If 
 
 The leader does not retry the write itself. It is the client's responsibility to retry idempotently (e.g., using application-level idempotency keys if needed). When a quorum attempt fails after some followers have applied, the leader triggers forced recovery on those followers so their state is rolled back to the leader's committed state.
 
+### Write Result Metadata
+
+On success, the leader emits a consistent write result that includes:
+- `applied_version` (the committed index/version)
+- `quorum` (the number of replicas required for commit)
+
+HTTP responses include these fields in the body, and gRPC responses surface them via response metadata headers.
+
 ---
 
 ## 8. Read Protocol

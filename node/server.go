@@ -481,11 +481,13 @@ type KVRequest struct {
 
 // KVResponse is returned by POST /kv/{shard_id}.
 type KVResponse struct {
-	OK            bool   `json:"ok"`
-	Value         string `json:"value,omitempty"`
-	Error         string `json:"error,omitempty"`
-	LeaderID      string `json:"leader_id,omitempty"`
-	LeaderAddress string `json:"leader_address,omitempty"`
+	OK             bool   `json:"ok"`
+	Value          string `json:"value,omitempty"`
+	Error          string `json:"error,omitempty"`
+	LeaderID       string `json:"leader_id,omitempty"`
+	LeaderAddress  string `json:"leader_address,omitempty"`
+	AppliedVersion uint64 `json:"applied_version,omitempty"`
+	Quorum         int    `json:"quorum,omitempty"`
 }
 
 func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
@@ -500,27 +502,24 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap := replica.StatusSnapshot()
-
-	// Only leaders serve KV requests.
-	if snap.Role != RoleLeader {
-		leaderAddr := ""
-		s.mu.RLock()
-		leaderAddr = s.nodeAddresses[snap.LeaderID]
-		s.mu.RUnlock()
-		s.m.WritesTotal.WithLabelValues(shardID, "not_leader").Inc()
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusMisdirectedRequest)
-		_ = json.NewEncoder(w).Encode(KVResponse{
-			OK:            false,
-			Error:         "NOT_LEADER",
-			LeaderID:      snap.LeaderID,
-			LeaderAddress: leaderAddr,
-		})
-		return
-	}
-
-	if !snap.IsReady {
+	snap, err := ensureLeaderReady(replica)
+	if err != nil {
+		if errors.Is(err, errNotLeader) {
+			leaderAddr := ""
+			s.mu.RLock()
+			leaderAddr = s.nodeAddresses[snap.LeaderID]
+			s.mu.RUnlock()
+			s.m.WritesTotal.WithLabelValues(shardID, "not_leader").Inc()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusMisdirectedRequest)
+			_ = json.NewEncoder(w).Encode(KVResponse{
+				OK:            false,
+				Error:         "NOT_LEADER",
+				LeaderID:      snap.LeaderID,
+				LeaderAddress: leaderAddr,
+			})
+			return
+		}
 		http.Error(w, "replica not ready", http.StatusServiceUnavailable)
 		return
 	}
@@ -543,24 +542,26 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(KVResponse{OK: true, Value: val})
 
 	case "put":
-		if err := s.leaderWrite(r.Context(), replica, req); err != nil {
+		result, err := s.leaderWrite(r.Context(), replica, req)
+		if err != nil {
 			s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
 			return
 		}
 		s.m.WritesTotal.WithLabelValues(shardID, "ok").Inc()
-		_ = json.NewEncoder(w).Encode(KVResponse{OK: true})
+		_ = json.NewEncoder(w).Encode(KVResponse{OK: true, AppliedVersion: result.AppliedVersion, Quorum: result.Quorum})
 
 	case "delete":
-		if err := s.leaderWrite(r.Context(), replica, req); err != nil {
+		result, err := s.leaderWrite(r.Context(), replica, req)
+		if err != nil {
 			s.m.WritesTotal.WithLabelValues(shardID, "quorum_unavailable").Inc()
 			w.WriteHeader(http.StatusServiceUnavailable)
 			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: err.Error()})
 			return
 		}
 		s.m.WritesTotal.WithLabelValues(shardID, "ok").Inc()
-		_ = json.NewEncoder(w).Encode(KVResponse{OK: true})
+		_ = json.NewEncoder(w).Encode(KVResponse{OK: true, AppliedVersion: result.AppliedVersion, Quorum: result.Quorum})
 
 	default:
 		http.Error(w, "unknown op: "+req.Op, http.StatusBadRequest)
@@ -568,7 +569,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 }
 
 // leaderWrite applies a write locally, fans out to followers, and checks quorum.
-func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVRequest) error {
+func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVRequest) (WriteResult, error) {
 	start := s.clock.Now()
 	defer func() {
 		s.m.WriteDuration.WithLabelValues(replica.ShardID).Observe(s.clock.Now().Sub(start).Seconds())
@@ -577,6 +578,9 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	defer replica.writeMu.Unlock()
 
 	now := s.clock.Now()
+	if _, err := ensureLeaderReady(replica); err != nil {
+		return WriteResult{}, err
+	}
 	replica.mu.RLock()
 	term := replica.Term
 	version := replica.Version + 1
@@ -605,50 +609,32 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	ds := s.diskStates[replica.ShardID]
 	s.mu.RUnlock()
 
-	// Determine quorum requirement based on "live" peers.
-	// Peers count as live if we've contacted them recently.
-	livenessWindow := s.cfg.LeaderHeartbeat * 2
-	livePeers := make(map[string]string, len(peerAddrs))
-	if livenessWindow <= 0 {
-		// No liveness tracking configured; treat all peers as eligible.
-		for id, addr := range peerAddrs {
-			livePeers[id] = addr
-		}
-	} else {
-		for id, addr := range peerAddrs {
-			if last, ok := peerLast[id]; ok && now.Sub(last) <= livenessWindow {
-				livePeers[id] = addr
-			}
-		}
-	}
-
-	// Total eligible replicas = live followers + leader.
-	totalEligible := len(livePeers) + 1
-	quorum := totalEligible/2 + 1
-	needed := quorum - 1 // leader already counts as 1
+	// Determine quorum requirement based on live peers.
+	quorumPlan := planQuorum(peerAddrs, peerLast, now, s.cfg.LeaderHeartbeat*2)
+	needed := quorumPlan.NeededFollowers
 
 	if needed == 0 {
 		// Single-replica shard; commit locally immediately.
 		replica.mu.Lock()
 		if err := replica.SM.Apply(entry, ApplyWithWAL); err != nil {
 			replica.mu.Unlock()
-			return fmt.Errorf("apply: %w", err)
+			return WriteResult{}, fmt.Errorf("apply: %w", err)
 		}
 		replica.IsReady = true
 		replica.mu.Unlock()
 		if ds != nil {
-			kv := replica.KV.Snapshot()
-			if err := ds.maybeSnapshot(term, version, kv); err != nil {
+			snap := replica.SM.Snapshot()
+			if err := ds.maybeSnapshot(term, version, snap.KV); err != nil {
 				log.Printf("snapshot failed shard_id=%s err=%v", replica.ShardID, err)
 			}
 		}
 		replica.WriteOpsTotal.Add(1)
-		return nil
+		return quorumPlan.result(entry.Version, 0), nil
 	}
 
-	if len(livePeers) < needed {
+	if !quorumPlan.hasLiveQuorum() {
 		replica.WriteErrTotal.Add(1)
-		return fmt.Errorf("quorum unavailable: need %d live followers, have %d", needed, len(livePeers))
+		return WriteResult{}, fmt.Errorf("quorum unavailable: need %d live followers, have %d", needed, len(quorumPlan.LivePeers))
 	}
 
 	replReq := ReplicateRequest{
@@ -658,11 +644,11 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 		Key:     entry.Key,
 		Value:   entry.Value,
 	}
-	acked := fanOutReplicate(ctx, replica.ShardID, replReq, livePeers, s.cfg.QuorumTimeout)
+	acked := fanOutReplicate(ctx, replica.ShardID, replReq, quorumPlan.LivePeers, s.cfg.QuorumTimeout)
 	if len(acked) < needed {
-		_ = fanOutForceRecover(ctx, replica.ShardID, livePeers, acked, s.cfg.QuorumTimeout)
+		_ = fanOutForceRecover(ctx, replica.ShardID, quorumPlan.LivePeers, acked, s.cfg.QuorumTimeout)
 		replica.WriteErrTotal.Add(1)
-		return fmt.Errorf("quorum unavailable: got %d/%d follower ACKs", len(acked), needed)
+		return WriteResult{}, fmt.Errorf("quorum unavailable: got %d/%d follower ACKs", len(acked), needed)
 	}
 
 	replica.mu.Lock()
@@ -671,20 +657,20 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	}
 	if err := replica.SM.Apply(entry, ApplyWithWAL); err != nil {
 		replica.mu.Unlock()
-		return fmt.Errorf("apply: %w", err)
+		return WriteResult{}, fmt.Errorf("apply: %w", err)
 	}
 	replica.IsReady = true
 	replica.mu.Unlock()
 
 	if ds != nil {
-		kv := replica.KV.Snapshot()
-		if err := ds.maybeSnapshot(term, version, kv); err != nil {
+		snap := replica.SM.Snapshot()
+		if err := ds.maybeSnapshot(term, version, snap.KV); err != nil {
 			log.Printf("snapshot failed shard_id=%s err=%v", replica.ShardID, err)
 		}
 	}
 
 	replica.WriteOpsTotal.Add(1)
-	return nil
+	return quorumPlan.result(entry.Version, len(acked)), nil
 }
 
 // handleReplicate handles POST /internal/replicate/{shard_id} from the leader.

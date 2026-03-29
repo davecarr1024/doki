@@ -83,37 +83,32 @@
 - Built a shared integration cluster control helper and reorganized integration tests by functional requirements.
 
 ## Next Tasks To Align Implementation With Design
-1. **Write path invariants**
-   - Assert leader-only writes in all entry points (gRPC + admin).
-   - Centralize quorum calculation and ack accounting in one module.
-   - Emit a single, consistent write result that includes applied index and quorum size.
-
-2. **Recovery semantics**
+1. **Recovery semantics**
    - Make recovery eligibility explicit with a state enum (`Healthy`, `Lagging`, `Recovering`, `Unavailable`).
    - Ensure recovery cannot advance applied index past missing log entries.
    - Track recovery source selection and expose it in status.
 
-3. **Membership + sharding**
+2. **Membership + sharding**
    - Define a single authoritative shard map source (coordinator) and deprecate local overrides.
    - Validate shard ownership transitions (handoff) before accepting writes.
    - Record shard map version in node status and logs for auditability.
 
-4. **Durability + snapshots**
+3. **Durability + snapshots**
    - Define snapshot cadence and retention policy in config (not implicit).
    - Track snapshot state in metadata and expose it via status.
    - Add corruption detection and guard rails on snapshot load.
 
-5. **Configuration + validation**
+4. **Configuration + validation**
    - Centralize config validation with explicit defaults and required fields.
    - Fail fast on invalid configs at startup (before serving).
    - Expose effective config in a read-only admin endpoint.
 
-6. **Observability**
+5. **Observability**
    - Standardize metric names and labels for RPC, replication, and recovery.
    - Add structured logs for write lifecycle and recovery steps.
    - Add trace IDs to cross-node requests for debugging.
 
-7. **Error model**
+6. **Error model**
    - Normalize gRPC errors (status codes + details) for retryable vs fatal failures.
    - Align admin HTTP errors with gRPC status semantics.
    - Add tests for error translations and retry paths.
@@ -123,3 +118,4 @@
 - Unit and integration tests migrated to gRPC.
 - Integration tests reorganized by functional requirements with a shared cluster control harness.
 - State machine boundary added for apply/replay/snapshot with snapshot format versioning and WAL monotonicity checks.
+- Write path invariants centralized (leader guard, quorum planning) with consistent write result metadata.
