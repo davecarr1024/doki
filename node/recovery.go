@@ -64,6 +64,16 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 
 	switch resp.Type {
 	case nodev1.RecoverResponse_TYPE_ENTRIES:
+		expected := replica.Version + 1
+		for _, e := range resp.Entries {
+			if e.Version <= replica.Version {
+				continue
+			}
+			if e.Version != expected {
+				return "", fmt.Errorf("recovery gap: expected version %d got %d", expected, e.Version)
+			}
+			expected++
+		}
 		for _, e := range resp.Entries {
 			// Skip entries we already have (may arrive via replication concurrently).
 			if e.Version <= replica.Version {
@@ -81,6 +91,8 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 			}
 		}
 		replica.IsReady = true
+		replica.RecoveryState = RecoveryStateHealthy
+		replica.RecoverySource = ""
 		// Clear bootstrap hint now that first recovery succeeded.
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""
@@ -98,6 +110,8 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 			return "", fmt.Errorf("apply snapshot: %w", err)
 		}
 		replica.IsReady = true
+		replica.RecoveryState = RecoveryStateHealthy
+		replica.RecoverySource = ""
 		// Clear bootstrap hint now that first recovery succeeded.
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""
@@ -132,8 +146,14 @@ func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr f
 			shardID := replica.ShardID
 			bootstrapAddr := replica.BootstrapLeaderAddr
 			hasBootstrap := replica.BootstrapShardID != ""
+			leaderID := replica.LeaderID
+			bootstrapShardID := replica.BootstrapShardID
 			replica.mu.RUnlock()
 			if ready {
+				replica.mu.Lock()
+				replica.RecoveryState = RecoveryStateHealthy
+				replica.RecoverySource = ""
+				replica.mu.Unlock()
 				continue
 			}
 			leaderAddr := getLeaderAddr()
@@ -146,11 +166,31 @@ func runRecoveryLoop(ctx context.Context, replica *ReplicaState, getLeaderAddr f
 				leaderAddr = bootstrapAddr
 			}
 			if leaderAddr == "" {
+				replica.mu.Lock()
+				replica.RecoveryState = RecoveryStateUnavailable
+				replica.RecoverySource = ""
+				replica.mu.Unlock()
 				continue
 			}
+			replica.mu.Lock()
+			replica.RecoveryState = RecoveryStateRecovering
+			if hasBootstrap {
+				replica.RecoverySource = recoverySourceBootstrap(bootstrapShardID)
+			} else {
+				replica.RecoverySource = recoverySourceLeader(leaderID)
+			}
+			replica.mu.Unlock()
 			recoveryType, err := doIncrementalRecovery(ctx, replica, leaderAddr, ds)
 			if err != nil {
 				log.Printf("recovery attempt failed shard_id=%s err=%v", shardID, err)
+				replica.mu.Lock()
+				replica.RecoveryState = RecoveryStateLagging
+				if hasBootstrap {
+					replica.RecoverySource = recoverySourceBootstrap(bootstrapShardID)
+				} else {
+					replica.RecoverySource = recoverySourceLeader(leaderID)
+				}
+				replica.mu.Unlock()
 			} else {
 				replica.RecoveryCount.Add(1)
 				if m != nil {

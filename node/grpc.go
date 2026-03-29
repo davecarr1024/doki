@@ -90,6 +90,8 @@ func (g *grpcServer) Replicate(ctx context.Context, req *nodev1.ReplicateRequest
 	if req.Version != replica.Version+1 {
 		term := replica.Term
 		replica.IsReady = false
+		replica.RecoveryState = RecoveryStateLagging
+		replica.RecoverySource = recoverySourceLeader(replica.LeaderID)
 		replica.LastLeaderContact = g.s.clock.Now()
 		replica.SM.ResetLog()
 		replica.mu.Unlock()
@@ -110,6 +112,8 @@ func (g *grpcServer) Replicate(ctx context.Context, req *nodev1.ReplicateRequest
 		return nil, status.Errorf(codes.Internal, "wal append: %v", err)
 	}
 	replica.IsReady = true
+	replica.RecoveryState = RecoveryStateHealthy
+	replica.RecoverySource = ""
 	replica.LastLeaderContact = g.s.clock.Now()
 	replica.mu.Unlock()
 
@@ -179,6 +183,8 @@ func (g *grpcServer) ForceRecover(ctx context.Context, req *nodev1.ForceRecoverR
 	}
 	replica.mu.Lock()
 	replica.IsReady = false
+	replica.RecoveryState = RecoveryStateLagging
+	replica.RecoverySource = recoverySourceLeader(replica.LeaderID)
 	replica.SM.ResetLog()
 	replica.LastLeaderContact = g.s.clock.Now()
 	replica.mu.Unlock()
@@ -258,12 +264,14 @@ func (g *grpcServer) GetStatus(ctx context.Context, req *nodev1.GetStatusRequest
 	for _, rep := range g.s.replicas {
 		snap := rep.StatusSnapshot()
 		shards = append(shards, &nodev1.ShardStatus{
-			ShardId: snap.ShardID,
-			Role:    string(snap.Role),
-			Term:    snap.Term,
-			Version: snap.Version,
-			IsReady: snap.IsReady,
-			Peers:   append([]string(nil), snap.Peers...),
+			ShardId:        snap.ShardID,
+			Role:           string(snap.Role),
+			Term:           snap.Term,
+			Version:        snap.Version,
+			IsReady:        snap.IsReady,
+			RecoveryState:  string(snap.RecoveryState),
+			RecoverySource: snap.RecoverySource,
+			Peers:          append([]string(nil), snap.Peers...),
 		})
 	}
 	nodeID := g.s.cfg.Node.ID

@@ -239,6 +239,8 @@ message ShardStatus {
   bool is_ready = 5;
   repeated string peers = 6;
   map<string, uint64> peer_versions = 7;  // leader only: follower versions
+  string recovery_state = 8;
+  string recovery_source = 9;
 }
 
 message GetStatusResponse {

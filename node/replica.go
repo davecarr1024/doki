@@ -55,6 +55,11 @@ type ReplicaState struct {
 	// Not-ready replicas do not count toward quorum.
 	IsReady bool
 
+	// RecoveryState captures the recovery posture for status reporting.
+	RecoveryState RecoveryState
+	// RecoverySource records the chosen recovery source (leader or bootstrap).
+	RecoverySource string
+
 	// Peers is the list of other node IDs that host replicas of this shard.
 	Peers []string
 
@@ -115,6 +120,7 @@ func NewReplicaState(shardID, nodeID string, peers []string, logSize int, electi
 		NodeID:          nodeID,
 		Role:            RoleFollower,
 		IsReady:         false, // becomes ready after initial recovery
+		RecoveryState:   RecoveryStateLagging,
 		Peers:           peers,
 		KV:              memory.New(),
 		RepLog:          replicationlog.New(logSize),
@@ -131,17 +137,19 @@ func (r *ReplicaState) StatusSnapshot() ReplicaStatusSnapshot {
 	r.mu.RLock()
 	lastContact := r.LastLeaderContact
 	snap := ReplicaStatusSnapshot{
-		ShardID:       r.ShardID,
-		Role:          r.Role,
-		LeaderID:      r.LeaderID,
-		Term:          r.Term,
-		Version:       r.Version,
-		IsReady:       r.IsReady,
-		Peers:         append([]string(nil), r.Peers...),
-		ElectionCount: r.ElectionCount.Load(),
-		RecoveryCount: r.RecoveryCount.Load(),
-		WriteOpsTotal: r.WriteOpsTotal.Load(),
-		WriteErrTotal: r.WriteErrTotal.Load(),
+		ShardID:        r.ShardID,
+		Role:           r.Role,
+		LeaderID:       r.LeaderID,
+		Term:           r.Term,
+		Version:        r.Version,
+		IsReady:        r.IsReady,
+		RecoveryState:  r.RecoveryState,
+		RecoverySource: r.RecoverySource,
+		Peers:          append([]string(nil), r.Peers...),
+		ElectionCount:  r.ElectionCount.Load(),
+		RecoveryCount:  r.RecoveryCount.Load(),
+		WriteOpsTotal:  r.WriteOpsTotal.Load(),
+		WriteErrTotal:  r.WriteErrTotal.Load(),
 	}
 	r.mu.RUnlock()
 	if !lastContact.IsZero() {
@@ -153,16 +161,18 @@ func (r *ReplicaState) StatusSnapshot() ReplicaStatusSnapshot {
 // ReplicaStatusSnapshot is a point-in-time copy of a ReplicaState's observable fields.
 // Returned by StatusSnapshot() for use in HTTP responses.
 type ReplicaStatusSnapshot struct {
-	ShardID             string   `json:"shard_id"`
-	Role                Role     `json:"role"`
-	LeaderID            string   `json:"leader_id"`
-	Term                uint64   `json:"term"`
-	Version             uint64   `json:"version"`
-	IsReady             bool     `json:"is_ready"`
-	Peers               []string `json:"peers"`
-	LastLeaderContactMs int64    `json:"last_leader_contact_ms"`
-	ElectionCount       int64    `json:"election_count"`
-	RecoveryCount       int64    `json:"recovery_count"`
-	WriteOpsTotal       int64    `json:"write_ops_total"`
-	WriteErrTotal       int64    `json:"write_err_total"`
+	ShardID             string        `json:"shard_id"`
+	Role                Role          `json:"role"`
+	LeaderID            string        `json:"leader_id"`
+	Term                uint64        `json:"term"`
+	Version             uint64        `json:"version"`
+	IsReady             bool          `json:"is_ready"`
+	RecoveryState       RecoveryState `json:"recovery_state"`
+	RecoverySource      string        `json:"recovery_source,omitempty"`
+	Peers               []string      `json:"peers"`
+	LastLeaderContactMs int64         `json:"last_leader_contact_ms"`
+	ElectionCount       int64         `json:"election_count"`
+	RecoveryCount       int64         `json:"recovery_count"`
+	WriteOpsTotal       int64         `json:"write_ops_total"`
+	WriteErrTotal       int64         `json:"write_err_total"`
 }

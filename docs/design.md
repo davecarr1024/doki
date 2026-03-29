@@ -296,6 +296,8 @@ ReplicaState {
   kv:                    map<key, value>  // the actual data
   rep_log:               Log              // bounded replication log (Phase 3)
   is_ready:              bool             // false during recovery
+  recovery_state:        RecoveryState    // HEALTHY/LAGGING/RECOVERING/UNAVAILABLE
+  recovery_source:       string           // leader:<id> or bootstrap:<shard>
   peers:                 []NodeId         // other replica nodes for this shard
   // Phase 4: election state
   last_leader_contact:   timestamp        // last valid leader message; drives election timer
@@ -321,6 +323,16 @@ The version is used to compare replica freshness during leader election and reco
 ### Readiness
 
 A replica is **not ready** (`is_ready = false`) when it is recovering — i.e., it has requested a snapshot from the leader but has not yet applied it. While not ready, a follower does not serve traffic and does not count toward quorum.
+
+### Recovery States
+
+Replicas expose a recovery state to clarify progress:
+- `HEALTHY`: replica is ready and up to date
+- `LAGGING`: replica has detected a version gap and needs recovery
+- `RECOVERING`: replica is actively fetching log entries or a snapshot
+- `UNAVAILABLE`: replica cannot recover yet (no leader or source)
+
+`recovery_source` records which leader or bootstrap shard is used for recovery.
 
 ---
 

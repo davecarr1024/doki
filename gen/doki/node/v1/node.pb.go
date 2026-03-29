@@ -1535,16 +1535,18 @@ func (*GetStatusRequest) Descriptor() ([]byte, []int) {
 }
 
 type ShardStatus struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	ShardId       string                 `protobuf:"bytes,1,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
-	Role          string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
-	Term          uint64                 `protobuf:"varint,3,opt,name=term,proto3" json:"term,omitempty"`
-	Version       uint64                 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
-	IsReady       bool                   `protobuf:"varint,5,opt,name=is_ready,json=isReady,proto3" json:"is_ready,omitempty"`
-	Peers         []string               `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
-	PeerVersions  map[string]uint64      `protobuf:"bytes,7,rep,name=peer_versions,json=peerVersions,proto3" json:"peer_versions,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"` // leader only: follower versions
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state          protoimpl.MessageState `protogen:"open.v1"`
+	ShardId        string                 `protobuf:"bytes,1,opt,name=shard_id,json=shardId,proto3" json:"shard_id,omitempty"`
+	Role           string                 `protobuf:"bytes,2,opt,name=role,proto3" json:"role,omitempty"`
+	Term           uint64                 `protobuf:"varint,3,opt,name=term,proto3" json:"term,omitempty"`
+	Version        uint64                 `protobuf:"varint,4,opt,name=version,proto3" json:"version,omitempty"`
+	IsReady        bool                   `protobuf:"varint,5,opt,name=is_ready,json=isReady,proto3" json:"is_ready,omitempty"`
+	Peers          []string               `protobuf:"bytes,6,rep,name=peers,proto3" json:"peers,omitempty"`
+	PeerVersions   map[string]uint64      `protobuf:"bytes,7,rep,name=peer_versions,json=peerVersions,proto3" json:"peer_versions,omitempty" protobuf_key:"bytes,1,opt,name=key" protobuf_val:"varint,2,opt,name=value"` // leader only: follower versions
+	RecoveryState  string                 `protobuf:"bytes,8,opt,name=recovery_state,json=recoveryState,proto3" json:"recovery_state,omitempty"`
+	RecoverySource string                 `protobuf:"bytes,9,opt,name=recovery_source,json=recoverySource,proto3" json:"recovery_source,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
 }
 
 func (x *ShardStatus) Reset() {
@@ -1624,6 +1626,20 @@ func (x *ShardStatus) GetPeerVersions() map[string]uint64 {
 		return x.PeerVersions
 	}
 	return nil
+}
+
+func (x *ShardStatus) GetRecoveryState() string {
+	if x != nil {
+		return x.RecoveryState
+	}
+	return ""
+}
+
+func (x *ShardStatus) GetRecoverySource() string {
+	if x != nil {
+		return x.RecoverySource
+	}
+	return ""
 }
 
 type GetStatusResponse struct {
@@ -1796,7 +1812,7 @@ const file_doki_node_v1_node_proto_rawDesc = "" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12\x12\n" +
 	"\x04term\x18\x03 \x01(\x04R\x04term\"\x15\n" +
 	"\x13SetFollowerResponse\"\x12\n" +
-	"\x10GetStatusRequest\"\xae\x02\n" +
+	"\x10GetStatusRequest\"\xfe\x02\n" +
 	"\vShardStatus\x12\x19\n" +
 	"\bshard_id\x18\x01 \x01(\tR\ashardId\x12\x12\n" +
 	"\x04role\x18\x02 \x01(\tR\x04role\x12\x12\n" +
@@ -1804,7 +1820,9 @@ const file_doki_node_v1_node_proto_rawDesc = "" +
 	"\aversion\x18\x04 \x01(\x04R\aversion\x12\x19\n" +
 	"\bis_ready\x18\x05 \x01(\bR\aisReady\x12\x14\n" +
 	"\x05peers\x18\x06 \x03(\tR\x05peers\x12P\n" +
-	"\rpeer_versions\x18\a \x03(\v2+.doki.node.v1.ShardStatus.PeerVersionsEntryR\fpeerVersions\x1a?\n" +
+	"\rpeer_versions\x18\a \x03(\v2+.doki.node.v1.ShardStatus.PeerVersionsEntryR\fpeerVersions\x12%\n" +
+	"\x0erecovery_state\x18\b \x01(\tR\rrecoveryState\x12'\n" +
+	"\x0frecovery_source\x18\t \x01(\tR\x0erecoverySource\x1a?\n" +
 	"\x11PeerVersionsEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\x04R\x05value:\x028\x01\"\x86\x01\n" +

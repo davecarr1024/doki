@@ -159,6 +159,7 @@ func (s *Server) initShardLocked(shard shardmap.ShardInfo, resp coordinator.Shar
 		// must apply the source shard's data first.
 		if shard.BootstrapSourceShardID == "" {
 			r.IsReady = true
+			r.RecoveryState = RecoveryStateHealthy
 		}
 	}
 	r.LeaderID = shard.Leader
@@ -200,6 +201,7 @@ func (s *Server) initShardLocked(shard shardmap.ShardInfo, resp coordinator.Shar
 					log.Printf("disk state apply failed shard_id=%s err=%v", shard.ID, err)
 				} else {
 					r.IsReady = true // disk state means we don't need network recovery
+					r.RecoveryState = RecoveryStateHealthy
 				}
 				r.BootstrapShardID = ""
 				r.BootstrapLeaderAddr = ""
@@ -414,6 +416,7 @@ func (s *Server) leaderAddrForReplica(r *ReplicaState) string {
 }
 
 func (s *Server) registerRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /status", s.handleStatus)
 	mux.HandleFunc("GET /ready", s.handleReady)
 	// Reliability: Prometheus metrics.
 	mux.Handle("GET /metrics", s.m.Handler())
@@ -621,6 +624,8 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 			return WriteResult{}, fmt.Errorf("apply: %w", err)
 		}
 		replica.IsReady = true
+		replica.RecoveryState = RecoveryStateHealthy
+		replica.RecoverySource = ""
 		replica.mu.Unlock()
 		if ds != nil {
 			snap := replica.SM.Snapshot()
@@ -660,6 +665,8 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 		return WriteResult{}, fmt.Errorf("apply: %w", err)
 	}
 	replica.IsReady = true
+	replica.RecoveryState = RecoveryStateHealthy
+	replica.RecoverySource = ""
 	replica.mu.Unlock()
 
 	if ds != nil {
@@ -727,6 +734,8 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	if req.Version != replica.Version+1 {
 		term := replica.Term
 		replica.IsReady = false
+		replica.RecoveryState = RecoveryStateLagging
+		replica.RecoverySource = recoverySourceLeader(replica.LeaderID)
 		replica.LastLeaderContact = s.clock.Now()
 		replica.mu.Unlock()
 		s.m.ReplicationsTotal.WithLabelValues(shardID, "gap").Inc()
@@ -752,6 +761,8 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	replica.IsReady = true
+	replica.RecoveryState = RecoveryStateHealthy
+	replica.RecoverySource = ""
 	// Phase 4: valid replication from leader proves leader is alive; reset election timer.
 	replica.LastLeaderContact = s.clock.Now()
 	replica.mu.Unlock()
@@ -889,6 +900,8 @@ func (s *Server) handleForceRecover(w http.ResponseWriter, r *http.Request) {
 
 	replica.mu.Lock()
 	replica.IsReady = false
+	replica.RecoveryState = RecoveryStateLagging
+	replica.RecoverySource = recoverySourceLeader(replica.LeaderID)
 	replica.SM.ResetLog()
 	replica.LastLeaderContact = s.clock.Now()
 	replica.mu.Unlock()
@@ -1029,6 +1042,7 @@ func (s *Server) refetchShardMap() {
 				// pending — the recovery loop will set IsReady once it completes.
 				if r.BootstrapShardID == "" {
 					r.IsReady = true
+					r.RecoveryState = RecoveryStateHealthy
 				}
 				log.Printf("promoted to leader shard_id=%s", shard.ID)
 			} else if shard.Leader != s.cfg.Node.ID && r.Role == RoleLeader {

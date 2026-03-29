@@ -245,8 +245,10 @@ func TestHandleReplicate_GapTriggersRecovery(t *testing.T) {
 	require.NotNil(t, replica)
 	replica.mu.RLock()
 	isReady := replica.IsReady
+	recoveryState := replica.RecoveryState
 	replica.mu.RUnlock()
 	assert.False(t, isReady, "gap should mark replica not-ready")
+	assert.Equal(t, RecoveryStateLagging, recoveryState)
 }
 
 func TestHandleForceRecover_MarksNotReadyAndResetsLog(t *testing.T) {
