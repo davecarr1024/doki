@@ -185,14 +185,22 @@ func (s *Server) initShardLocked(shard shardmap.ShardInfo, resp coordinator.Shar
 			log.Printf("disk state open failed shard_id=%s err=%v — continuing without disk state", shard.ID, err)
 		} else {
 			s.diskStates[shard.ID] = ds
+			if r.SM != nil {
+				r.SM.SetDiskState(ds)
+			}
 			loaded, err := ds.load()
 			if err != nil {
 				log.Printf("disk state load failed shard_id=%s err=%v", shard.ID, err)
 			} else if loaded.Valid {
-				r.KV.ApplySnapshot(loaded.KV)
-				r.Version = loaded.Version
-				r.Term = loaded.Term
-				r.IsReady = true // disk state means we don't need network recovery
+				if err := r.SM.ApplySnapshot(StateSnapshot{
+					Term:    loaded.Term,
+					Version: loaded.Version,
+					KV:      loaded.KV,
+				}, SnapshotNoPersist); err != nil {
+					log.Printf("disk state apply failed shard_id=%s err=%v", shard.ID, err)
+				} else {
+					r.IsReady = true // disk state means we don't need network recovery
+				}
 				r.BootstrapShardID = ""
 				r.BootstrapLeaderAddr = ""
 				log.Printf("disk state restored shard_id=%s version=%d term=%d", shard.ID, loaded.Version, loaded.Term)
@@ -527,7 +535,7 @@ func (s *Server) handleKV(w http.ResponseWriter, r *http.Request) {
 
 	switch req.Op {
 	case "get":
-		val, ok := replica.KV.Get(req.Key)
+		val, ok := replica.SM.Get(req.Key)
 		if !ok {
 			_ = json.NewEncoder(w).Encode(KVResponse{OK: false, Error: "not found"})
 			return
@@ -622,10 +630,11 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	if needed == 0 {
 		// Single-replica shard; commit locally immediately.
 		replica.mu.Lock()
-		if err := applyReplicatedEntryLocked(replica, entry, ds); err != nil {
+		if err := replica.SM.Apply(entry, ApplyWithWAL); err != nil {
 			replica.mu.Unlock()
 			return fmt.Errorf("apply: %w", err)
 		}
+		replica.IsReady = true
 		replica.mu.Unlock()
 		if ds != nil {
 			kv := replica.KV.Snapshot()
@@ -660,10 +669,11 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	for _, peerID := range acked {
 		replica.PeerLastContact[peerID] = now
 	}
-	if err := applyReplicatedEntryLocked(replica, entry, ds); err != nil {
+	if err := replica.SM.Apply(entry, ApplyWithWAL); err != nil {
 		replica.mu.Unlock()
 		return fmt.Errorf("apply: %w", err)
 	}
+	replica.IsReady = true
 	replica.mu.Unlock()
 
 	if ds != nil {
@@ -677,38 +687,12 @@ func (s *Server) leaderWrite(ctx context.Context, replica *ReplicaState, req KVR
 	return nil
 }
 
-func applyReplicatedEntryLocked(replica *ReplicaState, entry replicationlog.Entry, ds *diskState) error {
-	if ds != nil {
-		walEntry := walEntryFrom(entry.Op, entry.Key, entry.Value, entry.Term, entry.Version)
-		if err := ds.appendWAL(walEntry); err != nil {
-			return fmt.Errorf("wal append: %w", err)
-		}
-	}
-
-	switch entry.Op {
-	case "put":
-		replica.KV.Put(entry.Key, entry.Value)
-	case "delete":
-		replica.KV.Delete(entry.Key)
-	}
-	if entry.Version > replica.Version {
-		replica.Version = entry.Version
-	}
-	if entry.Term > replica.Term {
-		replica.Term = entry.Term
-	}
-	replica.RepLog.Append(entry)
-	replica.IsReady = true
-	return nil
-}
-
 // handleReplicate handles POST /internal/replicate/{shard_id} from the leader.
 func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 	shardID := r.PathValue("shard_id")
 
 	s.mu.RLock()
 	replica := s.replicas[shardID]
-	ds := s.diskStates[shardID]
 	s.mu.RUnlock()
 
 	if replica == nil {
@@ -772,7 +756,7 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		Key:     req.Key,
 		Value:   req.Value,
 	}
-	if err := applyReplicatedEntryLocked(replica, entry, ds); err != nil {
+	if err := replica.SM.Apply(entry, ApplyWithWAL); err != nil {
 		replica.mu.Unlock()
 		s.m.ReplicationsTotal.WithLabelValues(shardID, "wal_error").Inc()
 		log.Printf("replicate wal append failed shard_id=%s err=%v", shardID, err)
@@ -781,6 +765,7 @@ func (s *Server) handleReplicate(w http.ResponseWriter, r *http.Request) {
 		_ = json.NewEncoder(w).Encode(ReplicateResponse{Success: false, Error: "wal error"})
 		return
 	}
+	replica.IsReady = true
 	// Phase 4: valid replication from leader proves leader is alive; reset election timer.
 	replica.LastLeaderContact = s.clock.Now()
 	replica.mu.Unlock()
@@ -810,16 +795,14 @@ func (s *Server) handleSync(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not leader", http.StatusServiceUnavailable)
 		return
 	}
-	kv := replica.KV.Snapshot()
-	version := replica.Version
-	term := replica.Term
+	snap := replica.SM.Snapshot()
 	replica.mu.RUnlock()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(SyncResponse{
-		Term:    term,
-		Version: version,
-		KV:      kv,
+		Term:    snap.Term,
+		Version: snap.Version,
+		KV:      snap.KV,
 	})
 }
 
@@ -858,19 +841,19 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not leader", http.StatusServiceUnavailable)
 		return
 	}
-	leaderVersion := replica.Version
-	term := replica.Term
+	snap := replica.SM.Snapshot()
+	leaderVersion := snap.Version
+	term := snap.Term
 
 	var resp RecoverResponse
 	resp.Version = leaderVersion
 
 	if sinceVersion > leaderVersion {
 		// Follower is ahead (likely applied uncommitted entries). Force snapshot rollback.
-		kv := replica.KV.Snapshot()
 		replica.mu.RUnlock()
 		resp.Type = "snapshot"
 		resp.Term = term
-		resp.KV = kv
+		resp.KV = snap.KV
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
 		return
@@ -885,7 +868,7 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	entries, ok := replica.RepLog.Since(sinceVersion)
+	entries, ok := replica.SM.EntriesSince(sinceVersion)
 	if ok && (len(entries) > 0 || leaderVersion == sinceVersion) {
 		// Log covers the gap: send entries.
 		replica.mu.RUnlock()
@@ -897,11 +880,10 @@ func (s *Server) handleRecover(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Gap too large or log empty with leader ahead: send full snapshot.
-	kv := replica.KV.Snapshot()
 	replica.mu.RUnlock()
 	resp.Type = "snapshot"
 	resp.Term = term
-	resp.KV = kv
+	resp.KV = snap.KV
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(resp)
 }
@@ -921,7 +903,7 @@ func (s *Server) handleForceRecover(w http.ResponseWriter, r *http.Request) {
 
 	replica.mu.Lock()
 	replica.IsReady = false
-	replica.RepLog.Reset()
+	replica.SM.ResetLog()
 	replica.LastLeaderContact = s.clock.Now()
 	replica.mu.Unlock()
 

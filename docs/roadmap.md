@@ -89,7 +89,7 @@ GET  /internal/sync/{shard_id}        full state snapshot for recovery
 
 **What Was Built:**
 - `internal/wal/` — append-only `wal.jsonl` with one JSON entry per line; `Append` fsyncs before returning; `ReadAll` stops at any corrupt/partial line
-- `internal/snapshot/` — atomic `snapshot.json` via temp-file rename; stores `{term, version, kv}`
+- `internal/snapshot/` — atomic `snapshot.json` via temp-file rename; stores `{format_version, term, version, kv}`
 - `node/diskstate.go` — per-shard manager: `openDiskState`, `load` (snapshot + WAL replay), `appendWAL`, `maybeSnapshot` (triggers every N writes)
 - `node/server.go` updated: `InitShards` opens disk state and loads if valid (marks replica ready immediately); `leaderWrite` and `handleReplicate` both append to WAL before applying to memory
 

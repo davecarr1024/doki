@@ -699,6 +699,25 @@ On restart, recovery proceeds:
 2. Replay any WAL entries written after the snapshot
 3. If the resulting version is still behind the leader, fall back to remote recovery
 
+### State Machine Boundary
+
+All shard state mutations go through a **StateMachine** boundary that owns:
+- apply/replay of replicated log entries
+- full snapshot load and creation
+- WAL persistence for durable applies
+
+The state machine is the only entry point for apply, replay, and snapshot:
+
+```go
+type StateMachine interface {
+    Get(key string) (string, bool)
+    Snapshot() StateSnapshot
+    Apply(entry replicationlog.Entry, mode ApplyMode) error
+    ApplySnapshot(snap StateSnapshot, mode SnapshotMode) error
+    EntriesSince(version uint64) ([]replicationlog.Entry, bool)
+}
+```
+
 ### Storage Interface
 
 All application code accesses storage through the `Storage` interface:
@@ -713,7 +732,7 @@ type Storage interface {
 }
 ```
 
-Only the in-memory implementation (`internal/storage/memory`) exists. The WAL and snapshot are a separate durability layer (`node/diskstate.go`) that wraps the in-memory store rather than replacing it.
+Only the in-memory implementation (`internal/storage/memory`) exists. The WAL and snapshot are a separate durability layer (`node/diskstate.go`) that wraps the in-memory store rather than replacing it. Snapshot files include a `format_version`, and WAL replay enforces monotonic version ordering at load time.
 
 ---
 

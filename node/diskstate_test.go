@@ -96,8 +96,8 @@ func TestDiskState_SnapshotPlusWAL(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, result.Valid)
 	assert.Equal(t, uint64(8), result.Version)
-	assert.Equal(t, "new", result.KV["a"])    // updated by WAL
-	assert.NotContains(t, result.KV, "b")     // deleted by WAL
+	assert.Equal(t, "new", result.KV["a"])   // updated by WAL
+	assert.NotContains(t, result.KV, "b")    // deleted by WAL
 	assert.Equal(t, "added", result.KV["c"]) // added by WAL
 }
 
@@ -148,4 +148,19 @@ func TestDiskState_MaybeSnapshot_Triggers(t *testing.T) {
 	require.True(t, result.Valid)
 	assert.Equal(t, uint64(3), result.Version)
 	assert.Equal(t, "v", result.KV["k"])
+}
+
+func TestDiskState_Load_RejectsNonMonotonicWAL(t *testing.T) {
+	ds, dir := openTestDiskState(t, 100)
+
+	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 2, Op: "put", Key: "k", Value: "v2"}))
+	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v1"}))
+	require.NoError(t, ds.close())
+
+	ds2, err := openDiskState(dir, 100)
+	require.NoError(t, err)
+	defer func() { _ = ds2.close() }()
+
+	_, err = ds2.load()
+	require.Error(t, err)
 }

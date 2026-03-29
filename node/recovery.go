@@ -76,7 +76,7 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 				Key:     string(e.Op.GetKey()),
 				Value:   string(e.Op.GetValue()),
 			}
-			if err := applyReplicatedEntryLocked(replica, entry, ds); err != nil {
+			if err := replica.SM.Apply(entry, ApplyWithWAL); err != nil {
 				return "", fmt.Errorf("apply entry: %w", err)
 			}
 		}
@@ -90,16 +90,14 @@ func doIncrementalRecovery(ctx context.Context, replica *ReplicaState, leaderAdd
 
 	case nodev1.RecoverResponse_TYPE_SNAPSHOT:
 		kv := kvFromProto(resp.Kv)
-		replica.KV.ApplySnapshot(kv)
-		replica.Version = resp.Version
-		replica.Term = resp.Term
-		replica.IsReady = true
-		replica.RepLog.Reset()
-		if ds != nil {
-			if err := ds.resetSnapshot(resp.Term, resp.Version, kv); err != nil {
-				return "", fmt.Errorf("disk snapshot reset: %w", err)
-			}
+		if err := replica.SM.ApplySnapshot(StateSnapshot{
+			Term:    resp.Term,
+			Version: resp.Version,
+			KV:      kv,
+		}, SnapshotPersist); err != nil {
+			return "", fmt.Errorf("apply snapshot: %w", err)
 		}
+		replica.IsReady = true
 		// Clear bootstrap hint now that first recovery succeeded.
 		replica.BootstrapShardID = ""
 		replica.BootstrapLeaderAddr = ""

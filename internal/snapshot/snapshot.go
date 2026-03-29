@@ -12,17 +12,26 @@ import (
 	"os"
 )
 
+const CurrentFormatVersion = 1
+
 // Snapshot is the full persistent state of a shard replica at one point in time.
 type Snapshot struct {
-	Term    uint64            `json:"term"`
-	Version uint64            `json:"version"`
-	KV      map[string]string `json:"kv"`
+	FormatVersion int               `json:"format_version"`
+	Term          uint64            `json:"term"`
+	Version       uint64            `json:"version"`
+	KV            map[string]string `json:"kv"`
 }
 
 // Save writes s to path atomically.
 // If the call returns nil, the snapshot is guaranteed to be on disk even if
 // the process crashes immediately after.
 func Save(path string, s Snapshot) error {
+	if s.FormatVersion == 0 {
+		s.FormatVersion = CurrentFormatVersion
+	}
+	if s.FormatVersion != CurrentFormatVersion {
+		return fmt.Errorf("unsupported snapshot format version %d", s.FormatVersion)
+	}
 	data, err := json.Marshal(s)
 	if err != nil {
 		return fmt.Errorf("marshal snapshot: %w", err)
@@ -70,6 +79,12 @@ func Load(path string) (Snapshot, bool, error) {
 	var s Snapshot
 	if err := json.Unmarshal(data, &s); err != nil {
 		return Snapshot{}, false, fmt.Errorf("parse snapshot %q: %w", path, err)
+	}
+	if s.FormatVersion == 0 {
+		s.FormatVersion = CurrentFormatVersion
+	}
+	if s.FormatVersion != CurrentFormatVersion {
+		return Snapshot{}, false, fmt.Errorf("unsupported snapshot format version %d", s.FormatVersion)
 	}
 	return s, true, nil
 }

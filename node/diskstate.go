@@ -88,6 +88,11 @@ func (ds *diskState) load() (diskLoadResult, error) {
 		return diskLoadResult{}, nil // fresh start; nothing on disk
 	}
 
+	// Enforce monotonic WAL versions.
+	if err := ensureMonotonicWAL(entries); err != nil {
+		return diskLoadResult{}, fmt.Errorf("wal monotonicity: %w", err)
+	}
+
 	// Build state: start from snapshot baseline.
 	kv := make(map[string]string, len(snap.KV))
 	for k, v := range snap.KV {
@@ -117,6 +122,20 @@ func (ds *diskState) load() (diskLoadResult, error) {
 
 	log.Printf("diskstate: loaded path=%s version=%d term=%d keys=%d", ds.snapshotPath, version, term, len(kv))
 	return diskLoadResult{Term: term, Version: version, KV: kv, Valid: true}, nil
+}
+
+func ensureMonotonicWAL(entries []wal.Entry) error {
+	if len(entries) == 0 {
+		return nil
+	}
+	last := entries[0].Version
+	for i := 1; i < len(entries); i++ {
+		if entries[i].Version < last {
+			return fmt.Errorf("version decreased at index %d: %d -> %d", i, last, entries[i].Version)
+		}
+		last = entries[i].Version
+	}
+	return nil
 }
 
 // appendWAL writes an entry to the WAL and syncs to disk before returning.

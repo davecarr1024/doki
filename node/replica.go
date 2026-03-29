@@ -66,6 +66,9 @@ type ReplicaState struct {
 	// followers can catch up via log replay instead of a full snapshot.
 	RepLog *replicationlog.Log
 
+	// SM is the single entry point for apply/replay/snapshot operations.
+	SM StateMachine
+
 	// Phase 4: election state (all protected by mu).
 
 	// LastLeaderContact is the last time a valid leader message was received
@@ -107,7 +110,7 @@ type ReplicaState struct {
 // electionTimeout is the randomized election timeout for Phase 4; pass 0 to
 // disable election timer behaviour (useful for Phase 0–3 unit tests).
 func NewReplicaState(shardID, nodeID string, peers []string, logSize int, electionTimeout time.Duration) *ReplicaState {
-	return &ReplicaState{
+	r := &ReplicaState{
 		ShardID:         shardID,
 		NodeID:          nodeID,
 		Role:            RoleFollower,
@@ -118,6 +121,8 @@ func NewReplicaState(shardID, nodeID string, peers []string, logSize int, electi
 		ElectionTimeout: electionTimeout,
 		PeerLastContact: make(map[string]time.Time, len(peers)),
 	}
+	r.SM = newShardStateMachine(r.KV, r.RepLog, &r.Term, &r.Version, nil)
+	return r
 }
 
 // StatusSnapshot returns a read-safe copy of the replica's current status.

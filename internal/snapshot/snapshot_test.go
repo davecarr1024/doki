@@ -22,6 +22,7 @@ func TestSnapshot_SaveAndLoad(t *testing.T) {
 	got, exists, err := snapshot.Load(path)
 	require.NoError(t, err)
 	require.True(t, exists)
+	assert.Equal(t, snapshot.CurrentFormatVersion, got.FormatVersion)
 	assert.Equal(t, s.Term, got.Term)
 	assert.Equal(t, s.Version, got.Version)
 	assert.Equal(t, s.KV, got.KV)
@@ -70,4 +71,27 @@ func TestSnapshot_EmptyKV(t *testing.T) {
 	require.True(t, exists)
 	assert.Equal(t, uint64(5), got.Version)
 	assert.Empty(t, got.KV)
+}
+
+func TestSnapshot_Load_LegacyWithoutFormatVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.json")
+	data := []byte(`{"term":2,"version":9,"kv":{"a":"b"}}`)
+	require.NoError(t, os.WriteFile(path, data, 0644))
+
+	got, exists, err := snapshot.Load(path)
+	require.NoError(t, err)
+	require.True(t, exists)
+	assert.Equal(t, snapshot.CurrentFormatVersion, got.FormatVersion)
+	assert.Equal(t, uint64(9), got.Version)
+	assert.Equal(t, "b", got.KV["a"])
+}
+
+func TestSnapshot_Load_UnsupportedFormatVersion(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "future.json")
+	data := []byte(`{"format_version":99,"term":2,"version":9,"kv":{"a":"b"}}`)
+	require.NoError(t, os.WriteFile(path, data, 0644))
+
+	_, exists, err := snapshot.Load(path)
+	assert.Error(t, err)
+	assert.False(t, exists)
 }

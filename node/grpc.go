@@ -47,7 +47,7 @@ func (g *grpcServer) Get(ctx context.Context, req *nodev1.GetRequest) (*nodev1.G
 		return &nodev1.GetResponse{Result: nodev1.GetResponse_RESULT_NOT_READY}, nil
 	}
 
-	val, ok := replica.KV.Get(string(req.Key))
+	val, ok := replica.SM.Get(string(req.Key))
 	if !ok {
 		return &nodev1.GetResponse{Result: nodev1.GetResponse_RESULT_NOT_FOUND}, nil
 	}
@@ -58,7 +58,6 @@ func (g *grpcServer) Replicate(ctx context.Context, req *nodev1.ReplicateRequest
 	shardID := req.ShardId
 	g.s.mu.RLock()
 	replica := g.s.replicas[shardID]
-	ds := g.s.diskStates[shardID]
 	g.s.mu.RUnlock()
 	if replica == nil {
 		return nil, status.Errorf(codes.NotFound, "shard not found")
@@ -88,7 +87,7 @@ func (g *grpcServer) Replicate(ctx context.Context, req *nodev1.ReplicateRequest
 		term := replica.Term
 		replica.IsReady = false
 		replica.LastLeaderContact = g.s.clock.Now()
-		replica.RepLog.Reset()
+		replica.SM.ResetLog()
 		replica.mu.Unlock()
 		g.s.m.ReplicationsTotal.WithLabelValues(shardID, "gap").Inc()
 		return &nodev1.ReplicateResponse{Success: false, Term: term}, nil
@@ -101,11 +100,12 @@ func (g *grpcServer) Replicate(ctx context.Context, req *nodev1.ReplicateRequest
 		Key:     key,
 		Value:   value,
 	}
-	if err := applyReplicatedEntryLocked(replica, entry, ds); err != nil {
+	if err := replica.SM.Apply(entry, ApplyWithWAL); err != nil {
 		replica.mu.Unlock()
 		g.s.m.ReplicationsTotal.WithLabelValues(shardID, "wal_error").Inc()
 		return nil, status.Errorf(codes.Internal, "wal append: %v", err)
 	}
+	replica.IsReady = true
 	replica.LastLeaderContact = g.s.clock.Now()
 	replica.mu.Unlock()
 
@@ -130,17 +130,17 @@ func (g *grpcServer) Recover(ctx context.Context, req *nodev1.RecoverRequest) (*
 		return nil, status.Errorf(codes.FailedPrecondition, "not leader")
 	}
 
-	leaderVersion := replica.Version
-	term := replica.Term
+	snap := replica.SM.Snapshot()
+	leaderVersion := snap.Version
+	term := snap.Term
 
 	resp := &nodev1.RecoverResponse{Version: leaderVersion}
 
 	if sinceVersion > leaderVersion {
-		kv := replica.KV.Snapshot()
 		replica.mu.RUnlock()
 		resp.Type = nodev1.RecoverResponse_TYPE_SNAPSHOT
 		resp.Term = term
-		resp.Kv = kvToProto(kv)
+		resp.Kv = kvToProto(snap.KV)
 		return resp, nil
 	}
 
@@ -150,7 +150,7 @@ func (g *grpcServer) Recover(ctx context.Context, req *nodev1.RecoverRequest) (*
 		return resp, nil
 	}
 
-	entries, ok := replica.RepLog.Since(sinceVersion)
+	entries, ok := replica.SM.EntriesSince(sinceVersion)
 	if ok && (len(entries) > 0 || leaderVersion == sinceVersion) {
 		replica.mu.RUnlock()
 		resp.Type = nodev1.RecoverResponse_TYPE_ENTRIES
@@ -158,11 +158,10 @@ func (g *grpcServer) Recover(ctx context.Context, req *nodev1.RecoverRequest) (*
 		return resp, nil
 	}
 
-	kv := replica.KV.Snapshot()
 	replica.mu.RUnlock()
 	resp.Type = nodev1.RecoverResponse_TYPE_SNAPSHOT
 	resp.Term = term
-	resp.Kv = kvToProto(kv)
+	resp.Kv = kvToProto(snap.KV)
 	return resp, nil
 }
 
@@ -176,7 +175,7 @@ func (g *grpcServer) ForceRecover(ctx context.Context, req *nodev1.ForceRecoverR
 	}
 	replica.mu.Lock()
 	replica.IsReady = false
-	replica.RepLog.Reset()
+	replica.SM.ResetLog()
 	replica.LastLeaderContact = g.s.clock.Now()
 	replica.mu.Unlock()
 	return &nodev1.ForceRecoverResponse{}, nil

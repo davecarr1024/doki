@@ -56,7 +56,7 @@ func (s *Server) getKV(shardID, key string) (string, bool) {
 	if r == nil {
 		return "", false
 	}
-	return r.KV.Get(key)
+	return r.SM.Get(key)
 }
 
 // setKV writes a key into the named shard's KV store directly (test-only).
@@ -65,7 +65,14 @@ func (s *Server) setKV(shardID, key, value string) {
 	r := s.replicas[shardID]
 	s.mu.RUnlock()
 	if r != nil {
-		r.KV.Put(key, value)
+		r.mu.Lock()
+		snap := r.SM.Snapshot()
+		if snap.KV == nil {
+			snap.KV = make(map[string]string)
+		}
+		snap.KV[key] = value
+		_ = r.SM.ApplySnapshot(snap, SnapshotNoPersist)
+		r.mu.Unlock()
 	}
 }
 
@@ -253,17 +260,18 @@ func TestHandleForceRecover_MarksNotReadyAndResetsLog(t *testing.T) {
 	require.NotNil(t, replica)
 	replica.mu.Lock()
 	replica.IsReady = true
-	replica.RepLog.Append(replicationlog.Entry{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v"})
+	err := replica.SM.Apply(replicationlog.Entry{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v"}, ApplyWithoutWAL)
+	require.NoError(t, err)
 	replica.mu.Unlock()
 
 	ctx, cancel := grpcContext(time.Second)
 	defer cancel()
-	_, err := client.ForceRecover(ctx, &nodev1.ForceRecoverRequest{ShardId: "shard-0"})
+	_, err = client.ForceRecover(ctx, &nodev1.ForceRecoverRequest{ShardId: "shard-0"})
 	require.NoError(t, err)
 
 	replica.mu.RLock()
 	isReady := replica.IsReady
-	logLen := replica.RepLog.Len()
+	logLen := replica.SM.LogLen()
 	replica.mu.RUnlock()
 	assert.False(t, isReady)
 	assert.Equal(t, 0, logLen)
@@ -279,9 +287,9 @@ func TestHandleRecover_FollowerAheadGetsSnapshot(t *testing.T) {
 	leader.mu.RUnlock()
 	require.NotNil(t, replica)
 	replica.mu.Lock()
-	err := applyReplicatedEntryLocked(replica, replicationlog.Entry{
+	err := replica.SM.Apply(replicationlog.Entry{
 		Term: 1, Version: 1, Op: "put", Key: "k", Value: "v",
-	}, nil)
+	}, ApplyWithoutWAL)
 	replica.mu.Unlock()
 	require.NoError(t, err)
 
@@ -512,7 +520,7 @@ func TestHandleKV_PutAndGetWithReplicationLog(t *testing.T) {
 	leader.mu.RLock()
 	replica := leader.replicas["shard-0"]
 	leader.mu.RUnlock()
-	before := replica.RepLog.Len()
+	before := replica.SM.LogLen()
 
 	addr := startTestNodeGRPC(t, leader)
 	client := dialNodeClient(t, addr)
@@ -522,7 +530,7 @@ func TestHandleKV_PutAndGetWithReplicationLog(t *testing.T) {
 	require.NoError(t, err)
 
 	replica.mu.RLock()
-	after := replica.RepLog.Len()
+	after := replica.SM.LogLen()
 	replica.mu.RUnlock()
 	assert.Greater(t, after, before)
 }
