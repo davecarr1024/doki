@@ -21,8 +21,13 @@ cd doki
 # Start coordinator + 3 nodes
 docker compose up
 
-# Check cluster health
-curl http://localhost:7000/status | jq .
+# Check cluster health (gRPC)
+grpcurl -plaintext \
+  -import-path proto \
+  -proto proto/doki/coordinator/v1/coordinator.proto \
+  -d '{}' \
+  localhost:7000 \
+  doki.coordinator.v1.CoordinatorService/GetStatus | jq .
 
 # Run a quick smoke test
 ./scripts/smoke_test.sh
@@ -106,7 +111,12 @@ All config values can be overridden via environment variables:
 ### Coordinator Health
 
 ```bash
-curl http://coordinator:7000/status
+grpcurl -plaintext \
+  -import-path proto \
+  -proto proto/doki/coordinator/v1/coordinator.proto \
+  -d '{}' \
+  coordinator:7000 \
+  doki.coordinator.v1.CoordinatorService/GetStatus
 ```
 
 Response:
@@ -136,7 +146,12 @@ Key fields:
 ### Node Health
 
 ```bash
-curl http://node-a:8000/status
+grpcurl -plaintext \
+  -import-path proto \
+  -proto proto/doki/node/v1/node.proto \
+  -d '{}' \
+  node-a:8000 \
+  doki.node.v1.NodeService/GetStatus
 ```
 
 Response:
@@ -256,7 +271,7 @@ curl -s -X POST http://coordinator:7000/admin/add_node \
 # → 200 OK
 ```
 
-After this call, start the new node binary. It will heartbeat in and appear in `/status`.
+After this call, start the new node binary. It will heartbeat in and appear in `GetStatus`.
 
 ### Migrate a Shard to New Nodes
 
@@ -271,13 +286,13 @@ curl -s -X POST http://coordinator:7000/admin/migrate_shard \
 
 The coordinator:
 1. Sets `Replicas = old ∪ new` so both old and new nodes serve the shard simultaneously
-2. New nodes detect the shard in their next `/shardmap` refresh and start recovery
+2. New nodes detect the shard in their next `GetShardMap` refresh and start recovery
 3. Once all new nodes have recovered (`incoming_replicas` all have `version > 0`), the coordinator swaps `Replicas = new` and assigns a leader from the new set
 4. Old nodes detect they are no longer in the shard map and drop the shard
 
 Monitor progress:
 ```bash
-watch -n 1 'curl -s http://coordinator:7000/shardmap | jq ".shards[] | select(.id==\"shard-0\") | {leader, replicas, incoming_replicas}"'
+watch -n 1 'grpcurl -plaintext -import-path proto -proto proto/doki/coordinator/v1/coordinator.proto -d "{}" coordinator:7000 doki.coordinator.v1.CoordinatorService/GetShardMap | jq ".shardMap.shards[] | select(.id==\"shard-0\") | {leader, replicas, incomingReplicas}"'
 ```
 
 Migration is complete when `incoming_replicas` is empty and `leader` is one of the new nodes.
@@ -297,7 +312,7 @@ The new shard nodes bootstrap their initial state from the source shard leader's
 
 Monitor progress:
 ```bash
-watch -n 1 'curl -s http://coordinator:7000/shardmap | jq ".shards[] | select(.id==\"shard-1\")"'
+watch -n 1 'grpcurl -plaintext -import-path proto -proto proto/doki/coordinator/v1/coordinator.proto -d "{}" coordinator:7000 doki.coordinator.v1.CoordinatorService/GetShardMap | jq ".shardMap.shards[] | select(.id==\"shard-1\")"'
 ```
 
 Split is complete when `shard-1` appears in the shard map with a `leader` and `incoming_replicas` is empty.
@@ -343,7 +358,7 @@ Monitor recovery:
 
 ```bash
 # Watch until is_ready: true
-watch -n 0.5 'curl -s http://localhost:8003/status | jq ".shards[].is_ready"'
+watch -n 0.5 'grpcurl -plaintext -import-path proto -proto proto/doki/node/v1/node.proto -d "{}" localhost:8003 doki.node.v1.NodeService/GetStatus | jq ".shards[].isReady"'
 ```
 
 ### Forcing a Leader Change
@@ -359,7 +374,7 @@ Not directly supported via API in v1. To change a leader:
 On the leader:
 
 ```bash
-curl -s http://node-a:8001/status | jq '.shards[] | {shard_id, version, peer_versions}'
+grpcurl -plaintext -import-path proto -proto proto/doki/node/v1/node.proto -d "{}" node-a:8001 doki.node.v1.NodeService/GetStatus | jq '.shards[] | {shardId, version, peerVersions}'
 ```
 
 Example output:
@@ -386,7 +401,7 @@ Example output:
 **Cause:** The leader cannot reach quorum (majority of replicas are down or unreachable).
 
 **Check:**
-1. How many replicas are alive? (`coordinator /status`)
+1. How many replicas are alive? (`CoordinatorService/GetStatus`)
 2. Is the quorum size correct? (3-node shard needs 2 alive)
 3. Are followers reachable from the leader? (check network, check follower logs)
 
@@ -402,7 +417,7 @@ Example output:
 
 **Check:**
 ```bash
-curl http://node-c:8003/status | jq '.shards[] | {shard_id, is_ready}'
+grpcurl -plaintext -import-path proto -proto proto/doki/node/v1/node.proto -d "{}" node-c:8003 doki.node.v1.NodeService/GetStatus | jq '.shards[] | {shardId, isReady}'
 docker compose logs node-c | grep -i recovery
 ```
 
@@ -420,7 +435,7 @@ docker compose logs node-c | grep -i recovery
 **Check:**
 ```bash
 docker compose logs node-a | grep heartbeat
-curl http://node-a:8001/status  # If this responds, the node is alive
+grpcurl -plaintext -import-path proto -proto proto/doki/node/v1/node.proto -d "{}" node-a:8001 doki.node.v1.NodeService/GetStatus  # If this responds, the node is alive
 ```
 
 **Resolution:**
@@ -439,7 +454,7 @@ curl http://node-a:8001/status  # If this responds, the node is alive
 ```bash
 for port in 8001 8002 8003; do
   echo "node :$port"
-  curl -s http://localhost:$port/status | jq '.shards[] | {shard_id, role, term}'
+  grpcurl -plaintext -import-path proto -proto proto/doki/node/v1/node.proto -d "{}" localhost:$port doki.node.v1.NodeService/GetStatus | jq '.shards[] | {shardId, role, term}'
 done
 ```
 
@@ -459,10 +474,10 @@ done
 **Check:**
 ```bash
 # Is the new node alive?
-curl http://coordinator:7000/status | jq '.nodes[] | select(.node_id=="node-d")'
+grpcurl -plaintext -import-path proto -proto proto/doki/coordinator/v1/coordinator.proto -d "{}" coordinator:7000 doki.coordinator.v1.CoordinatorService/GetStatus | jq '.nodes[] | select(.nodeId=="node-d")'
 
 # Does the new node know about the shard?
-curl http://node-d:8004/status | jq '.shards'
+grpcurl -plaintext -import-path proto -proto proto/doki/node/v1/node.proto -d "{}" node-d:8004 doki.node.v1.NodeService/GetStatus | jq '.shards'
 
 # Is recovery progressing?
 docker compose logs node-d | grep recovery
@@ -484,10 +499,10 @@ docker compose logs node-d | grep recovery
 **Check:**
 ```bash
 # Does the new shard appear in the shard map at all?
-curl http://coordinator:7000/shardmap | jq '.shards[] | select(.id=="shard-1")'
+grpcurl -plaintext -import-path proto -proto proto/doki/coordinator/v1/coordinator.proto -d "{}" coordinator:7000 doki.coordinator.v1.CoordinatorService/GetShardMap | jq '.shardMap.shards[] | select(.id=="shard-1")'
 
 # Is the new node attempting bootstrap recovery?
-curl http://node-d:8004/status | jq '.shards[] | select(.shard_id=="shard-1")'
+grpcurl -plaintext -import-path proto -proto proto/doki/node/v1/node.proto -d "{}" node-d:8004 doki.node.v1.NodeService/GetStatus | jq '.shards[] | select(.shardId=="shard-1")'
 ```
 
 **Resolution:**

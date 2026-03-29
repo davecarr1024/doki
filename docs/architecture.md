@@ -47,14 +47,14 @@ doki/
 │   ├── membership.go         # Node registry, heartbeat tracking, dynamic join
 │   ├── leader.go             # Leader assignment logic
 │   ├── migration.go          # MigrationManager: live shard migration + split (Phase 5)
-│   └── server.go             # HTTP server + handlers
+│   └── server.go             # gRPC server + admin HTTP endpoints
 ├── node/                     # Node library
 │   ├── replica.go            # Per-shard ReplicaState
 │   ├── election.go           # Distributed leader election (Phase 4)
 │   ├── recovery.go           # Incremental + bootstrap recovery (Phase 3 / 5)
 │   ├── replication.go        # Quorum replication fan-out
 │   ├── diskstate.go          # WAL + snapshot per shard (Phase 2)
-│   └── server.go             # HTTP server + handlers, heartbeat loop
+│   └── server.go             # gRPC server + admin HTTP endpoints
 ├── internal/
 │   ├── clock/                # Clock interface (real + fake)
 │   ├── config/               # Config types and YAML loading
@@ -79,9 +79,7 @@ doki/
 │   ├── integration/          # End-to-end tests (real servers, no Docker)
 │   └── reliability/          # Chaos, load, and monkey tests (build tag: reliability)
 ├── proto/                    # Protobuf definitions (gRPC, Phase 1+)
-│   ├── common.proto
-│   ├── coordinator.proto
-│   └── node.proto
+│   └── doki/
 ├── config/                   # Example YAML configs
 └── docker/                   # Dockerfiles + docker-compose
 ```
@@ -90,21 +88,24 @@ doki/
 
 ## Component Interfaces
 
-### Coordinator → Node (Phase 1+, HTTP/JSON)
+All runtime traffic uses gRPC over HTTP/2, served alongside a small HTTP surface
+(`/metrics`, `/ready`, and admin endpoints) via cmux on the same address.
+
+### Coordinator → Node (Phase 1+, gRPC)
 
 ```mermaid
 sequenceDiagram
     participant C as Coordinator
     participant N as Node
 
-    C->>N: AssignLeader(shard_id, term)
+    C->>N: AssignLeader(shard_id, new_term)
     N-->>C: OK
 
     C->>N: SetFollower(shard_id, leader_id, term)
     N-->>C: OK
 ```
 
-### Node → Coordinator (HTTP/JSON)
+### Node → Coordinator (gRPC)
 
 ```mermaid
 sequenceDiagram
@@ -112,15 +113,15 @@ sequenceDiagram
     participant C as Coordinator
 
     loop every heartbeat_interval
-        N->>C: POST /heartbeat {node_id, shards[]}
-        C-->>N: 200 OK {shard_map_version}
+        N->>C: Heartbeat(node_id, shards[])
+        C-->>N: HeartbeatResponse(shard_map_version)
     end
 
-    N->>C: GET /shardmap
+    N->>C: GetShardMap()
     C-->>N: ShardMap{version, shards[], node_addresses}
 ```
 
-### Operator → Coordinator: Dynamic Cluster Management (Phase 5)
+### Operator → Coordinator: Dynamic Cluster Management (Phase 5, HTTP Admin)
 
 ```mermaid
 sequenceDiagram
@@ -201,15 +202,15 @@ sequenceDiagram
     participant CO as Coordinator
     participant L as Leader
 
-    R->>CO: GET /shardmap
+    R->>CO: GetShardMap()
     CO-->>R: ShardMap (leader = "node-a")
 
-    R->>L: GET /internal/recover/{shard_id}?since_version=N
+    R->>L: Recover(shard_id, since_version=N)
     alt incremental (gap is small)
-        L-->>R: {type:"entries", entries:[...]}
+        L-->>R: RecoverResponse{type:ENTRIES, entries:[...]}
         note over R: apply log entries in order
     else snapshot fallback (gap too large)
-        L-->>R: {type:"snapshot", kv:{...}, version:V}
+        L-->>R: RecoverResponse{type:SNAPSHOT, kv:{...}, version:V}
         note over R: apply snapshot atomically
     end
     R->>R: is_ready = true
@@ -232,8 +233,8 @@ sequenceDiagram
     CO-->>OP: 200 {status: migrating}
 
     note over NEW: refetchShardMap detects new shards
-    NEW->>CO: GET /shardmap
-    NEW->>OLD: GET /internal/recover/{shard_id}
+    NEW->>CO: GetShardMap()
+    NEW->>OLD: Recover(shard_id, since_version=0)
     OLD-->>NEW: snapshot / entries
 
     loop health monitor tick
@@ -260,9 +261,9 @@ sequenceDiagram
     CO->>CO: Create new shard with BootstrapSourceShardID=source
     CO-->>OP: 200 {status: splitting}
 
-    NEW->>CO: GET /shardmap
+    NEW->>CO: GetShardMap()
     note over NEW: BootstrapSourceShardID set; is_ready=false
-    NEW->>SRC: GET /internal/recover/{source_shard_id}?since_version=0
+    NEW->>SRC: Recover(source_shard_id, since_version=0)
     SRC-->>NEW: snapshot of source shard
 
     note over NEW: apply snapshot; clear BootstrapSourceShardID; is_ready=true
@@ -336,13 +337,13 @@ sequenceDiagram
     note over CO: ready
 
     D->>N: start (depends_on: coordinator healthy)
-    N->>CO: GET /shardmap
+    N->>CO: GetShardMap()
     CO-->>N: ShardMap
     N->>N: init replica state for each shard
     N->>N: mark shards ready (Phase 0)
     note over N: ready
     loop every 500ms
-        N->>CO: POST /heartbeat
+        N->>CO: Heartbeat()
     end
 ```
 
@@ -361,7 +362,7 @@ flowchart TD
     D -- no --> F{Has prior WAL/snapshot?}
     F -- yes --> G[Replay WAL\nMark is_ready=true]
     F -- no --> H[Mark is_ready=false]
-    E --> I[Start HTTP server]
+    E --> I[Start gRPC server\n(admin HTTP endpoints via cmux)]
     G --> I
     H --> I
     I --> J[Start heartbeat goroutine]
@@ -381,7 +382,7 @@ flowchart TD
     A[Load config] --> B[Build shard map from ShardSpec list]
     B --> C[Assign initial leaders from config]
     C --> D[Init MigrationManager]
-    D --> E[Start HTTP server]
+    D --> E[Start gRPC server\n(admin HTTP endpoints via cmux)]
     E --> F[Start health monitor goroutine]
     F --> G{node heartbeat received?}
     G -- yes --> H[Record timestamp + shard versions]
@@ -414,7 +415,7 @@ flowchart TD
 
 ```mermaid
 graph LR
-    GS[HTTP Server goroutine] --> |dispatch| SH[Shard handlers]
+    GS[gRPC Server goroutine] --> |dispatch| SH[Shard handlers]
     SH --> |per-shard lock| RS[ReplicaState]
     HR[Heartbeat goroutine] --> CO[Coordinator]
     RP[Replication goroutines\none per follower] --> FN[Follower nodes]
@@ -493,6 +494,6 @@ DELETE FROM users WHERE id = 1;
 
 ## Security (v1: None)
 
-v1 has no authentication, authorization, or encryption. All traffic is plaintext HTTP/JSON (Phase 0) or plaintext gRPC (Phase 1+). This is acceptable for a local development and learning environment.
+v1 has no authentication, authorization, or encryption. All traffic is plaintext gRPC (plus a small HTTP admin/metrics surface). This is acceptable for a local development and learning environment.
 
 Future: mTLS for node-to-node communication; token-based auth for clients.

@@ -54,8 +54,8 @@ node heartbeat, status endpoint, shard map, and shard role assignment.
 - Shard map version tracking — nodes detect coordinator updates via heartbeat response
 
 **What Was Built:**
-- Coordinator: `ShardVersions` in heartbeat, `TermForShard`, leader prefers highest-version candidate, `/leader/{shard_id}` endpoint, shard map version in heartbeat response
-- Node: `POST /kv/{shard_id}` (put/get/delete), `POST /internal/replicate/{shard_id}`, `GET /internal/sync/{shard_id}`, recovery loop for followers
+- Coordinator: `ShardVersions` in heartbeat, `TermForShard`, leader prefers highest-version candidate, `WhereIsLeader` RPC, shard map version in heartbeat response
+- Node: `Put/Get/Delete`, `Replicate`, `SyncState` RPCs, recovery loop for followers
 - `node/replication.go`: `fanOutReplicate` fan-out with parallel goroutines and per-timeout context
 - `node/recovery.go`: `doRecovery` fetches full KV snapshot; `runRecoveryLoop` polls until ready
 
@@ -68,11 +68,9 @@ node heartbeat, status endpoint, shard map, and shard role assignment.
 **Completed:** All goals met. 6 KV integration tests + 16 node unit tests pass.
 
 ```
-POST /kv/{shard_id}         {"op":"put","key":"k","value":"v"}
-POST /kv/{shard_id}         {"op":"get","key":"k"}
-POST /kv/{shard_id}         {"op":"delete","key":"k"}
-POST /internal/replicate/{shard_id}   leader→follower write fan-out
-GET  /internal/sync/{shard_id}        full state snapshot for recovery
+NodeService/Put(Get/Delete)           client-facing KV ops
+NodeService/Replicate                 leader→follower write fan-out
+NodeService/SyncState                 full state snapshot stream for recovery
 ```
 
 ---
@@ -123,8 +121,8 @@ node/diskstate.go           per-shard WAL + snapshot manager
 **What Was Built:**
 - `internal/replicationlog/` — bounded `Log` type with `Append`, `Since(sinceVersion)`, `OldestVersion`; evicts oldest entry when at capacity
 - `ReplicaState.RepLog` — every replica (leader and follower) maintains a replication log; followers that get promoted to leader can serve incremental recovery immediately
-- `GET /internal/recover/{shard_id}?since_version=N` — leader responds with `{type:"entries", entries:[...]}` when log covers the gap, or `{type:"snapshot", kv:...}` as fallback
-- `doIncrementalRecovery` in `node/recovery.go` — tries `/internal/recover` first; applies log entries or snapshot transparently; replaces `doRecovery` (full snapshot) in the recovery loop
+- `Recover(shard_id, since_version)` — leader responds with entries when log covers the gap, or snapshot as fallback
+- `doIncrementalRecovery` in `node/recovery.go` — calls `Recover` first; applies log entries or snapshot transparently; replaces `doRecovery` (full snapshot) in the recovery loop
 - Duplicate guard in `handleReplicate`: if `req.Version <= replica.Version`, skip and ACK (prevents double-application when replication and recovery race)
 - `NodeConfig.ReplicationLogSize` — configurable log buffer size, defaults to 1000
 
@@ -141,7 +139,7 @@ internal/replicationlog/replicationlog.go   bounded in-memory log (circular buff
 node/replica.go                             RepLog field added to ReplicaState
 node/server.go                              handleRecover + log append in leaderWrite/handleReplicate
 node/recovery.go                            doIncrementalRecovery replaces full-snapshot loop
-GET /internal/recover/{shard_id}            incremental recovery endpoint
+Recover(shard_id, since_version)           incremental recovery endpoint
 ```
 
 ---
@@ -159,13 +157,13 @@ GET /internal/recover/{shard_id}            incremental recovery endpoint
 
 **What Was Built:**
 - `node/election.go`: `VoteRequest/Response`, `LeaderHeartbeatRequest/Response`
-- `POST /internal/request_vote/{shard_id}` — peers grant/deny vote based on term, version, and prior vote in this term
-- `POST /internal/leader_heartbeat/{shard_id}` — leader proves liveness to followers; resets follower election timers
+- `RequestVote` — peers grant/deny vote based on term, version, and prior vote in this term
+- `LeaderHeartbeat` — leader proves liveness to followers; resets follower election timers
 - `runElectionTimer` goroutine — fires election when no leader message received within randomised timeout (default 300–600ms)
 - `runLeaderHeartbeat` goroutine — leader sends heartbeats every `LeaderHeartbeat` (default 150ms)
 - `startElection` — increments term, requests votes, promotes self on quorum, notifies coordinator
-- `notifyCoordinatorElection` — best-effort POST to `POST /notify_leader`; election stands even if coordinator is down
-- Coordinator: `NotifyLeader` in `leader.go` accepts distributed election results if term > current term; `POST /notify_leader` handler in `server.go`
+- `notifyCoordinatorElection` — best-effort `NotifyLeader` RPC; election stands even if coordinator is down
+- Coordinator: `NotifyLeader` in `leader.go` accepts distributed election results if term > current term
 - `NodeConfig` additions: `LeaderHeartbeatMs`, `ElectionTimeoutMinMs`, `ElectionTimeoutMaxMs`
 - `ReplicaState` additions: `LastLeaderContact`, `VotedFor`, `VotedForTerm`, `ElectionTimeout`
 
@@ -181,9 +179,9 @@ GET /internal/recover/{shard_id}            incremental recovery endpoint
 Coordinator notification works: elected leader updates shard map directly; nodes refetch on next heartbeat.
 
 ```
-POST /internal/request_vote/{shard_id}      election vote request from candidate
-POST /internal/leader_heartbeat/{shard_id}  leader liveness heartbeat → resets election timer
-POST /notify_leader                         (coordinator) accept distributed election result
+NodeService/RequestVote                     election vote request from candidate
+NodeService/LeaderHeartbeat                 leader liveness heartbeat → resets election timer
+CoordinatorService/NotifyLeader             accept distributed election result
 node/election.go                            all Phase 4 election logic
 ```
 
@@ -207,7 +205,7 @@ node/election.go                            all Phase 4 election logic
 - `LeaderManager.InitTerm` — initialises term counter for dynamically-created shards
 - `buildShardMapResponse` now sources node addresses from `Membership` (not static config) so new nodes are visible to the cluster
 - `ShardInfo.BootstrapSourceShardID` — source-shard hint cleared after all replicas are ready
-- `ShardInfo.IncomingReplicas` — migration target tag, visible in `/shardmap` so clients can observe progress
+- `ShardInfo.IncomingReplicas` — migration target tag, visible in `GetShardMap` so clients can observe progress
 - `ShardMap.SetReplicas`, `SetIncomingReplicas`, `ClearBootstrapSource`, `RemoveShard` — new operations
 - Node: `initShardLocked` extracted from `InitShards`; called live when the shard map delivers new assignments
 - Node: `startShardGoroutines` / `dropShard` — per-shard `context.CancelFunc` prevents goroutine leaks on drop
@@ -230,6 +228,25 @@ coordinator/migration.go         MigrationManager — background migration monit
 internal/shardmap/shardmap.go    SetReplicas, SetIncomingReplicas, ClearBootstrapSource, RemoveShard
 node/server.go                   initShardLocked, startShardGoroutines, dropShard, live refetchShardMap
 ```
+
+---
+
+## Phase 5.5: Operational Alignment (Planned)
+
+**Theme:** Make runtime behavior explicit, observable, and safe to operate.
+
+**Goals:**
+- Centralized config validation with explicit defaults and fail-fast startup.
+- Read-only effective config endpoint (admin).
+- Consistent observability: metrics, structured logs, and trace IDs.
+- Unified error model across gRPC and admin HTTP surface.
+- RPC resilience: timeouts, retry budgets, and consistent dialing options.
+
+**Definition of Done:**
+- Config validation errors are deterministic and fully unit-tested.
+- Effective config endpoint returns resolved values for both node and coordinator.
+- Metrics and logs are aligned with docs and tested in integration.
+- gRPC status codes and admin error responses share the same semantics.
 
 ---
 

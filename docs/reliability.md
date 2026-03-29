@@ -31,7 +31,7 @@ measurable signals:
 | **recovery_events_total** | Cumulative count of full-snapshot recoveries (expensive) | Low; incremental should dominate |
 | **split_brain_detected** | Any moment where 2+ nodes claim LEADER for same (shard, term) | Always 0 |
 
-**Split-brain detection** is computed by polling all nodes' `/status` endpoints
+**Split-brain detection** is computed by polling all nodes' `GetStatus` RPCs
 and checking for duplicate (shard_id, term, role=LEADER) tuples. It must
 always be zero.
 
@@ -44,11 +44,11 @@ tests and during manual investigation.
 
 ### 2a. Status Endpoint Enhancements
 
-The existing `/status` endpoints expose per-shard role, version, term, and
+The existing `GetStatus` RPCs expose per-shard role, version, term, and
 ready state. The following additions will make them more useful for reliability
 work:
 
-**Coordinator `/status` additions:**
+**Coordinator `GetStatus` additions:**
 ```json
 {
   "shard_map_version": 5,
@@ -64,7 +64,7 @@ work:
 }
 ```
 
-**Node `/status` additions:**
+**Node `GetStatus` additions:**
 ```json
 {
   "node_id": "node-a",
@@ -151,16 +151,16 @@ tests). The full set of primitives planned:
 | Primitive | Mechanism | Simulates |
 |-----------|-----------|-----------|
 | `StopNode(id)` | Cancel node's context | Clean shutdown / crash |
-| `SlowNode(id, latency)` | Fault-injecting HTTP transport | Network degradation |
-| `PartitionNode(id)` | Block all HTTP to/from a node | Network partition |
+| `SlowNode(id, latency)` | Fault-injecting gRPC transport | Network degradation |
+| `PartitionNode(id)` | Block all gRPC to/from a node | Network partition |
 | `HealPartition(id)` | Remove the block | Partition healed |
 | `StopCoordinator()` | Cancel coordinator's context | Coordinator failure |
 | `DelayHeartbeats(d)` | Sleep in heartbeat sender | Clock skew / heartbeat delay |
 
-`SlowNode` and `PartitionNode` require a **fault-injecting HTTP transport**:
-a `http.RoundTripper` that wraps the default transport and intercepts calls
-to specific node addresses. Injected into the node's HTTP client at startup.
-This is simpler than Toxiproxy and requires no external processes.
+`SlowNode` and `PartitionNode` require a **fault-injecting gRPC transport**:
+interceptors or custom dialers that wrap the default transport and intercept
+calls to specific node addresses. Injected into the node's gRPC client stack
+at startup. This is simpler than Toxiproxy and requires no external processes.
 
 ### 3b. Chaos Test Scenarios
 
@@ -326,7 +326,7 @@ must be answered before marking the phase complete:
 - [ ] **Does the feature affect write latency or throughput?**
       If yes: re-run the load baseline and commit the new result.
 - [ ] **Does the feature add observable state?**
-      If yes: add metrics and expose them in `/status`.
+      If yes: add metrics and expose them in `GetStatus`.
 - [ ] **Are the new metrics asserted in at least one test?**
       Metrics that are never asserted provide false confidence.
 
@@ -365,7 +365,7 @@ The reliability layer is built incrementally. Suggested order:
 
 1. **Prometheus metrics** (coordinator + node) — adds `/metrics` endpoint and
    in-memory counters. Enables metric assertions in existing tests.
-2. **Enhanced `/status`** — replica_versions, last_leader_contact_ms,
+2. **Enhanced `GetStatus`** — replica_versions, last_leader_contact_ms,
    election_count, write ops counters.
 3. **Invariant checker** — `assertNoSplitBrain`, `assertQuorumAvailable`,
    `assertFollowersConverge` as shared test helpers.

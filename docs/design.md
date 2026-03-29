@@ -396,7 +396,7 @@ On success, the leader emits a consistent write result that includes:
 - `applied_version` (the committed index/version)
 - `quorum` (the number of replicas required for commit)
 
-HTTP responses include these fields in the body, and gRPC responses surface them via response metadata headers.
+gRPC responses surface these fields via response metadata headers.
 
 ---
 
@@ -479,10 +479,10 @@ sequenceDiagram
     participant CO as Coordinator
     participant L as Leader
 
-    R->>CO: GET /shardmap
+    R->>CO: GetShardMap()
     CO-->>R: ShardMap (leader = "node-a")
 
-    R->>L: GET /internal/recover/{shard_id}?since_version=N
+    R->>L: Recover(shard_id, since_version=N)
     alt incremental (gap fits in replication log)
         L-->>R: {type:"entries", entries:[{version, op, key, value},...]}
         note over R: apply each entry; version = entry.version; is_ready = true
@@ -622,27 +622,33 @@ MigrationRecord {
 }
 ```
 
-### HTTP APIs
+### gRPC APIs
 
-```
-// Called by nodes
-POST /heartbeat {node_id, shards:[{shard_id, version}]} → {shard_map_version}
+Coordinator service (control plane):
+- `Heartbeat(node_id, shards[]) -> shard_map_version`
+- `GetShardMap() -> shard_map, node_addresses`
+- `WhereIsLeader(shard_id) -> leader_node_id, address, term`
+- `GetStatus() -> shard_map_version, nodes[], shards[]`
+- `NotifyLeader(shard_id, leader_id, term) -> accepted`
 
-// Called by clients and nodes
-GET  /shardmap → ShardMap
+Node service (data plane + replication + recovery):
+- `Put/Get/Delete(shard_id, key, value)`
+- `Replicate(shard_id, term, version, op) -> ack`
+- `Recover(shard_id, since_version) -> entries or snapshot`
+- `ForceRecover(shard_id)`
+- `RequestVote/LeaderHeartbeat(shard_id, term, version, leader_id)`
+- `SyncState(shard_id) -> stream snapshot chunks`
+- `AssignLeader/SetFollower(shard_id, term, leader_id)`
+- `GetStatus()`
 
-// Called by nodes (leader election, Phase 4)
-POST /coordinator/notify_leader {shard_id, node_id, term}
+### HTTP Admin + Metrics
 
-// Admin (operator / tests)
-POST /admin/add_node       {node_id, address}
-POST /admin/migrate_shard  {shard_id, new_replicas}
-POST /admin/split_shard    {source_shard_id, new_shard_id, new_replicas}
-
-// Coordinator → Node (shard map push via HTTP)
-POST /assign_leader  {shard_id, term}
-POST /set_follower   {shard_id, leader_id, term}
-```
+HTTP is retained only for admin and observability:
+- `GET /metrics`
+- `GET /ready`
+- `POST /admin/add_node`
+- `POST /admin/migrate_shard`
+- `POST /admin/split_shard`
 
 ### Coordinator Failure in v1
 
@@ -762,7 +768,7 @@ Only the in-memory implementation (`internal/storage/memory`) exists. The WAL an
 
 ### Node Status API
 
-Every node exposes a `/status` endpoint returning:
+Every node exposes a `GetStatus` RPC returning:
 
 ```json
 {
@@ -790,7 +796,7 @@ Every node exposes a `/status` endpoint returning:
 
 ### Coordinator Status API
 
-The coordinator exposes a `/status` endpoint returning:
+The coordinator exposes a `GetStatus` RPC returning:
 
 ```json
 {

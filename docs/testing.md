@@ -39,7 +39,7 @@ go test ./...
 
 ### 2. Integration Tests
 
-Test a full cluster end-to-end using **real in-process HTTP servers** on random ports (`:0`). No Docker required.
+Test a full cluster end-to-end using **real in-process gRPC servers** on random ports (`:0`). No Docker required. HTTP is used only for `/ready` and `/metrics` checks.
 
 ```bash
 make test-int
@@ -54,12 +54,14 @@ Each test:
 
 ```
 test/integration/
-  helpers_test.go      # startCluster, waitForHTTP, postKV helpers
-  basic_test.go        # read/write/delete scenarios
-  failover_test.go     # leader failover, quorum scenarios
-  recovery_test.go     # snapshot and incremental recovery
-  election_test.go     # distributed leader election (Phase 4)
-  sharding_test.go     # dynamic add_node, migrate_shard, split_shard (Phase 5)
+  cluster_control.go          # StartCluster + gRPC helpers
+  kv_operations_test.go       # read/write/delete scenarios
+  replication_consistency_test.go
+  recovery_log_test.go
+  durability_test.go
+  election_failover_test.go
+  control_plane_test.go
+  sharding_admin_test.go
 ```
 
 ### 3. Reliability Tests (Chaos / Load / Monkey)
@@ -80,13 +82,13 @@ These use the `//go:build reliability` build tag and live in `test/reliability/`
 
 ### Test Cluster Builder
 
-`startCluster` in `helpers_test.go` builds a full cluster:
+`StartCluster` in `cluster_control.go` builds a full cluster:
 
 ```go
 cluster := startCluster(t, []string{"node-a", "node-b", "node-c"}, []config.ShardSpec{
     {ID: "shard-0", Replicas: []string{"node-a", "node-b", "node-c"}, InitialLeader: "node-a"},
 })
-// cluster.CoordinatorAddr  — coordinator HTTP address
+// cluster.CoordinatorAddr  — coordinator gRPC address
 // cluster.NodeAddrs        — map[nodeID]address
 ```
 
@@ -95,20 +97,17 @@ All servers use `t.Cleanup()` to shut down. Random ports prevent interference be
 ### Key Helpers
 
 ```go
-// postKV sends a KV operation to a node
-kvr, status := postKV(t, nodeAddr, shardID, node.KVRequest{Op: "put", Key: "k", Value: "v"})
+// nodeClient returns a gRPC client for a node
+client := nodeClient(t, nodeAddr)
 
-// leaderAddrFor returns the current leader's HTTP address for a shard
+// leaderAddrFor returns the current leader's gRPC address for a shard
 addr := leaderAddrFor(t, coordAddr, "shard-0")
 
-// waitForHTTP polls until a URL responds 200
-waitForHTTP(t, "http://"+addr+"/status", 5*time.Second)
+// waitForHTTP polls until /ready returns 200
+waitForHTTP(t, "http://"+addr+"/ready", 5*time.Second)
 
-// getJSONDecoded fetches a URL and JSON-decodes the response
-ok := getJSONDecoded(t, "http://"+addr+"/status", &result)
-
-// fetchShardMapRespHTTP fetches and returns the coordinator's shard map
-sm := fetchShardMapRespHTTP(t, "http://"+coordAddr+"/shardmap")
+// fetchShardMapRespGRPC fetches and returns the coordinator's shard map
+sm := fetchShardMapRespGRPC(t, coordAddr)
 ```
 
 ### Failure Injection
@@ -116,7 +115,7 @@ sm := fetchShardMapRespHTTP(t, "http://"+coordAddr+"/shardmap")
 Integration tests simulate failures by cancelling server contexts:
 
 ```go
-// Kill a node: cancel its context (stops all goroutines including HTTP server)
+// Kill a node: cancel its context (stops all goroutines including gRPC server)
 cancel()
 
 // Restart-equivalent: start a fresh server on the same or new address
@@ -201,7 +200,7 @@ These properties are checked in integration tests after every significant scenar
 At most one node has `role=LEADER` for a given `(shard_id, term)` at any point.
 
 ```go
-// AssertNoSplitBrain queries /status on all nodes and confirms at most
+// AssertNoSplitBrain queries GetStatus on all nodes and confirms at most
 // one LEADER per (shard_id, term).
 assertNoSplitBrain(t, cluster)
 ```
@@ -283,7 +282,7 @@ require.Eventually(t, func() bool {
 make test
 go test ./...
 
-# Integration tests (starts real HTTP servers)
+# Integration tests (starts real gRPC servers)
 make test-int
 go test -tags integration ./test/integration/... -v
 
@@ -322,7 +321,7 @@ Coverage is a guide, not a target. A badly-written test that hits a line is wors
 Integration test failures are diagnosed via:
 
 1. **Test logs** — use `-v` flag; each server logs to the test logger via `t.Logf`
-2. **Status snapshots** — tests call `/status` on coordinator and nodes during assertions
+2. **Status snapshots** — tests call `GetStatus` on coordinator and nodes during assertions
 3. **`require.Eventually` messages** — failure messages include a description of what was expected
 
 If a test is flaky:

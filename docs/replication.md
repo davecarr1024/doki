@@ -228,11 +228,11 @@ sequenceDiagram
     participant CO as Coordinator
     participant L as Leader
 
-    R->>CO: GET /shardmap
+    R->>CO: GetShardMap()
     CO-->>R: {leader: "node-a"}
 
     note over R: current version = 140
-    R->>L: GET /internal/recover/shard-0?since_version=140
+    R->>L: Recover(shard-0, since_version=140)
 
     alt log covers the gap (version 141–144 in log)
         L-->>R: {type:"entries", version:144, entries:[v141,v142,v143,v144]}
@@ -297,11 +297,11 @@ stateDiagram-v2
 
 ## Recovery Reuse for Shard Migration (Phase 5)
 
-The same incremental recovery protocol (`GET /internal/recover/{shard_id}?since_version=N`) is reused for live shard migration and shard splitting:
+The same incremental recovery protocol (`Recover(shard_id, since_version=N)`) is reused for live shard migration and shard splitting:
 
-**Migration:** When a shard is migrated to new nodes, the new nodes start with `version=0` and call `GET /internal/recover/shard-id?since_version=0` against the current leader. This is exactly the same as a fresh follower joining the shard.
+**Migration:** When a shard is migrated to new nodes, the new nodes start with `version=0` and call `Recover(shard-id, since_version=0)` against the current leader. This is exactly the same as a fresh follower joining the shard.
 
-**Split Bootstrap:** When a new shard is split from a source shard, the new shard's nodes have `BootstrapShardID=<source>`. Their recovery loop calls `GET /internal/recover/<source-shard-id>?since_version=0` against the **source shard's leader**, copying the source shard's current KV state as the new shard's initial state. Once recovery completes, the `BootstrapShardID` is cleared and the new shard evolves independently.
+**Split Bootstrap:** When a new shard is split from a source shard, the new shard's nodes have `BootstrapShardID=<source>`. Their recovery loop calls `Recover(<source-shard-id>, since_version=0)` against the **source shard's leader**, copying the source shard's current KV state as the new shard's initial state. Once recovery completes, the `BootstrapShardID` is cleared and the new shard evolves independently.
 
 This means the replication protocol is the only data transfer mechanism in the system — no separate bulk-load path is needed.
 
