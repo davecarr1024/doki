@@ -51,28 +51,33 @@
 # Doki Cleanup Plan — RPC Migration (gRPC)
 
 ## Current State
-- **HTTP/JSON** endpoints are still the primary RPC surface for coordinator and node.
-- `proto/doki/*` defines gRPC APIs but no generated code is checked in.
-- Node-to-node replication and node-to-coordinator heartbeats use HTTP.
-- Integration tests exercise HTTP endpoints.
-- HTTP is still used for `/metrics` and `/ready`.
+- **gRPC** is now the primary RPC surface for coordinator and node.
+- `proto/doki/*` is extended and generated into `gen/` via Buf.
+- Node-to-node replication/recovery and node-to-coordinator heartbeats use gRPC.
+- Integration tests exercise gRPC for KV, status, replication, and recovery.
+- HTTP remains only for `/metrics`, `/ready`, and admin endpoints.
 
-## Plan (To Execute)
+## Plan (Completed)
 1. **Proto + Codegen**
-   - Extend node/coordinator protos to cover current runtime needs (incremental recovery + leader notification).
+   - Extend node/coordinator protos to cover runtime needs (incremental recovery + leader notification).
    - Generate gRPC code into `gen/` with Buf.
-   - Verify `~/.local/go/bin/go test ./...`.
+   - Verified `~/.local/go/bin/go test ./...`.
 
 2. **gRPC Servers + Clients**
-   - Add gRPC servers for coordinator and node.
-   - Replace node → coordinator calls with gRPC (heartbeat, shard map, leader notify, status, leader lookup).
-   - Replace node → node replication + recovery with gRPC.
-   - Keep HTTP **only** for `/metrics`, `/ready`, and admin endpoints.
-   - Use cmux to serve gRPC + HTTP on the same address (no config change).
-   - Verify `~/.local/go/bin/go test ./...`.
+   - Added gRPC servers for coordinator and node.
+   - Replaced node → coordinator calls with gRPC (heartbeat, shard map, leader notify, status, leader lookup).
+   - Replaced node → node replication + recovery with gRPC.
+   - Kept HTTP **only** for `/metrics`, `/ready`, and admin endpoints.
+   - Used cmux to serve gRPC + HTTP on the same address (no config change).
+   - Verified `~/.local/go/bin/go test ./...`.
 
 3. **Test Migration**
-   - Update unit tests to exercise gRPC for replication and status calls where appropriate.
-   - Update integration tests to use gRPC for KV operations and status, while preserving `/ready` HTTP.
-   - Add integration coverage for gRPC replication/recovery paths.
-   - Verify `~/.local/go/bin/go test ./...` and `~/.local/go/bin/go test ./test/integration/... -tags=integration`.
+   - Unit tests now exercise gRPC for replication, recovery, and election paths.
+   - Integration tests now use a shared cluster control harness, with gRPC for KV, status, and recovery, and HTTP for `/ready` + admin endpoints.
+   - Tests reorganized by functional requirements (control plane, replication, recovery, durability, sharding).
+   - Verified `~/.local/go/bin/go test ./...` and `~/.local/go/bin/go test ./test/integration/... -tags=integration`.
+
+## Applied Changes
+- Added gRPC servers/clients for node and coordinator, served via cmux.
+- Migrated unit tests to gRPC RPCs and added a gRPC test harness for stubs.
+- Built a shared integration cluster control helper and reorganized integration tests by functional requirements.
