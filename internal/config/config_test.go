@@ -135,6 +135,8 @@ func TestParseNodeConfig(t *testing.T) {
 	assert.Equal(t, "coordinator:7000", cfg.CoordinatorAddress)
 	assert.Equal(t, "/data", cfg.DataDir)
 	assert.Equal(t, 500*time.Millisecond, cfg.HeartbeatInterval)
+	assert.Equal(t, 100, cfg.SnapshotInterval)
+	assert.Equal(t, 2, cfg.SnapshotRetention)
 }
 
 func TestParseNodeConfig_MissingID(t *testing.T) {
@@ -155,4 +157,17 @@ node:
 `)
 	_, err := config.ParseNodeConfig(yaml)
 	assert.ErrorContains(t, err, "coordinator_address")
+}
+
+func TestParseNodeConfig_InvalidSnapshotRetention(t *testing.T) {
+	yaml := []byte(`
+node:
+  id: "node-a"
+  address: "0.0.0.0:8000"
+coordinator_address: "coordinator:7000"
+snapshot_interval: 100
+snapshot_retention: -1
+`)
+	_, err := config.ParseNodeConfig(yaml)
+	assert.ErrorContains(t, err, "snapshot_retention")
 }

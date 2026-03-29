@@ -183,7 +183,7 @@ func (s *Server) initShardLocked(shard shardmap.ShardInfo, resp coordinator.Shar
 	// Try to load from disk if a data directory is configured.
 	if s.cfg.DataDir != "" {
 		shardDir := shardDataDir(s.cfg.DataDir, shard.ID)
-		ds, err := openDiskState(shardDir, s.cfg.SnapshotInterval)
+		ds, err := openDiskState(shardDir, s.cfg.SnapshotInterval, s.cfg.SnapshotRetention)
 		if err != nil {
 			log.Printf("disk state open failed shard_id=%s err=%v — continuing without disk state", shard.ID, err)
 		} else {

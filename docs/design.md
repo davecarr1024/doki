@@ -714,6 +714,8 @@ Each shard has a `DiskState` wrapping:
 1. A **WAL** — append-only log of `{op, key, value}` entries written before being applied to the in-memory KV
 2. A **snapshot** — a periodic atomic dump of the full KV state to disk
 
+Snapshots are rotated according to a configured retention policy, and load selects the newest valid snapshot (falling back to older snapshots if the latest is corrupt).
+
 On restart, recovery proceeds:
 1. Load the latest snapshot from disk into KV
 2. Replay any WAL entries written after the snapshot

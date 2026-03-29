@@ -4,3 +4,5 @@ node:
 coordinator_address: "coordinator:7000"
 data_dir: "/data"
 heartbeat_interval_ms: 500
+snapshot_interval: 100
+snapshot_retention: 2

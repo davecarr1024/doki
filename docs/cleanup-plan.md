@@ -83,22 +83,17 @@
 - Built a shared integration cluster control helper and reorganized integration tests by functional requirements.
 
 ## Next Tasks To Align Implementation With Design
-1. **Durability + snapshots**
-   - Define snapshot cadence and retention policy in config (not implicit).
-   - Track snapshot state in metadata and expose it via status.
-   - Add corruption detection and guard rails on snapshot load.
-
-2. **Configuration + validation**
+1. **Configuration + validation**
    - Centralize config validation with explicit defaults and required fields.
    - Fail fast on invalid configs at startup (before serving).
    - Expose effective config in a read-only admin endpoint.
 
-3. **Observability**
+2. **Observability**
    - Standardize metric names and labels for RPC, replication, and recovery.
    - Add structured logs for write lifecycle and recovery steps.
    - Add trace IDs to cross-node requests for debugging.
 
-4. **Error model**
+3. **Error model**
    - Normalize gRPC errors (status codes + details) for retryable vs fatal failures.
    - Align admin HTTP errors with gRPC status semantics.
    - Add tests for error translations and retry paths.
@@ -111,3 +106,4 @@
 - Write path invariants centralized (leader guard, quorum planning) with consistent write result metadata.
 - Recovery semantics now tracked explicitly with recovery states and sources, plus gap-safe recovery validation.
 - Shard map version is now tracked in node status/logs with shard-map freshness checks on writes.
+- Snapshot cadence/retention are now explicit in config, with rotating snapshots and fallback loading on corruption.

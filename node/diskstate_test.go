@@ -1,6 +1,7 @@
 package node
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -9,24 +10,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func openTestDiskState(t *testing.T, interval int) (*diskState, string) {
+func openTestDiskState(t *testing.T, interval, retention int) (*diskState, string) {
 	t.Helper()
 	dir := filepath.Join(t.TempDir(), "shard-test")
-	ds, err := openDiskState(dir, interval)
+	ds, err := openDiskState(dir, interval, retention)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = ds.close() })
 	return ds, dir
 }
 
 func TestDiskState_Load_Fresh(t *testing.T) {
-	ds, _ := openTestDiskState(t, 100)
+	ds, _ := openTestDiskState(t, 100, 1)
 	result, err := ds.load()
 	require.NoError(t, err)
 	assert.False(t, result.Valid, "no disk state on fresh start")
 }
 
 func TestDiskState_AppendAndLoad(t *testing.T) {
-	ds, dir := openTestDiskState(t, 100)
+	ds, dir := openTestDiskState(t, 100, 1)
 
 	entries := []wal.Entry{
 		{Term: 1, Version: 1, Op: "put", Key: "a", Value: "alpha"},
@@ -39,7 +40,7 @@ func TestDiskState_AppendAndLoad(t *testing.T) {
 	require.NoError(t, ds.close())
 
 	// Re-open and load.
-	ds2, err := openDiskState(dir, 100)
+	ds2, err := openDiskState(dir, 100, 1)
 	require.NoError(t, err)
 	defer func() { _ = ds2.close() }()
 
@@ -54,7 +55,7 @@ func TestDiskState_AppendAndLoad(t *testing.T) {
 }
 
 func TestDiskState_Snapshot_ThenLoad(t *testing.T) {
-	ds, dir := openTestDiskState(t, 100)
+	ds, dir := openTestDiskState(t, 100, 1)
 
 	// Write some entries and take a snapshot.
 	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 1, Op: "put", Key: "x", Value: "1"}))
@@ -64,7 +65,7 @@ func TestDiskState_Snapshot_ThenLoad(t *testing.T) {
 	require.NoError(t, ds.close())
 
 	// Re-open and load — should come entirely from snapshot.
-	ds2, err := openDiskState(dir, 100)
+	ds2, err := openDiskState(dir, 100, 1)
 	require.NoError(t, err)
 	defer func() { _ = ds2.close() }()
 
@@ -77,7 +78,7 @@ func TestDiskState_Snapshot_ThenLoad(t *testing.T) {
 }
 
 func TestDiskState_SnapshotPlusWAL(t *testing.T) {
-	ds, dir := openTestDiskState(t, 100)
+	ds, dir := openTestDiskState(t, 100, 1)
 
 	// Baseline snapshot at version 5.
 	require.NoError(t, ds.takeSnapshot(1, 5, map[string]string{"a": "old", "b": "keep"}))
@@ -88,7 +89,7 @@ func TestDiskState_SnapshotPlusWAL(t *testing.T) {
 	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 8, Op: "put", Key: "c", Value: "added"}))
 	require.NoError(t, ds.close())
 
-	ds2, err := openDiskState(dir, 100)
+	ds2, err := openDiskState(dir, 100, 1)
 	require.NoError(t, err)
 	defer func() { _ = ds2.close() }()
 
@@ -102,7 +103,7 @@ func TestDiskState_SnapshotPlusWAL(t *testing.T) {
 }
 
 func TestDiskState_WALEntriesBeforeSnapshotAreSkipped(t *testing.T) {
-	ds, dir := openTestDiskState(t, 100)
+	ds, dir := openTestDiskState(t, 100, 1)
 
 	// Append WAL entries for versions 1-3.
 	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 1, Op: "put", Key: "x", Value: "v1"}))
@@ -116,7 +117,7 @@ func TestDiskState_WALEntriesBeforeSnapshotAreSkipped(t *testing.T) {
 	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 4, Op: "put", Key: "x", Value: "v4"}))
 	require.NoError(t, ds.close())
 
-	ds2, err := openDiskState(dir, 100)
+	ds2, err := openDiskState(dir, 100, 1)
 	require.NoError(t, err)
 	defer func() { _ = ds2.close() }()
 
@@ -128,7 +129,7 @@ func TestDiskState_WALEntriesBeforeSnapshotAreSkipped(t *testing.T) {
 }
 
 func TestDiskState_MaybeSnapshot_Triggers(t *testing.T) {
-	ds, dir := openTestDiskState(t, 3) // snapshot every 3 writes
+	ds, dir := openTestDiskState(t, 3, 1) // snapshot every 3 writes
 
 	for i := range 3 {
 		v := uint64(i + 1)
@@ -139,7 +140,7 @@ func TestDiskState_MaybeSnapshot_Triggers(t *testing.T) {
 	require.NoError(t, ds.close())
 
 	// After snapshot, WAL should be empty, snapshot should exist.
-	ds2, err := openDiskState(dir, 3)
+	ds2, err := openDiskState(dir, 3, 1)
 	require.NoError(t, err)
 	defer func() { _ = ds2.close() }()
 
@@ -151,16 +152,37 @@ func TestDiskState_MaybeSnapshot_Triggers(t *testing.T) {
 }
 
 func TestDiskState_Load_RejectsNonMonotonicWAL(t *testing.T) {
-	ds, dir := openTestDiskState(t, 100)
+	ds, dir := openTestDiskState(t, 100, 1)
 
 	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 2, Op: "put", Key: "k", Value: "v2"}))
 	require.NoError(t, ds.appendWAL(wal.Entry{Term: 1, Version: 1, Op: "put", Key: "k", Value: "v1"}))
 	require.NoError(t, ds.close())
 
-	ds2, err := openDiskState(dir, 100)
+	ds2, err := openDiskState(dir, 100, 1)
 	require.NoError(t, err)
 	defer func() { _ = ds2.close() }()
 
 	_, err = ds2.load()
 	require.Error(t, err)
+}
+
+func TestDiskState_Load_FallsBackToOlderSnapshot(t *testing.T) {
+	ds, dir := openTestDiskState(t, 100, 2)
+
+	require.NoError(t, ds.takeSnapshot(1, 1, map[string]string{"a": "old"}))
+	require.NoError(t, ds.takeSnapshot(1, 2, map[string]string{"a": "new"}))
+	require.NoError(t, ds.close())
+
+	latestPath := filepath.Join(dir, "snapshot.json")
+	require.NoError(t, os.WriteFile(latestPath, []byte("{bad json"), 0644))
+
+	ds2, err := openDiskState(dir, 100, 2)
+	require.NoError(t, err)
+	defer func() { _ = ds2.close() }()
+
+	result, err := ds2.load()
+	require.NoError(t, err)
+	require.True(t, result.Valid)
+	assert.Equal(t, uint64(1), result.Version)
+	assert.Equal(t, "old", result.KV["a"])
 }

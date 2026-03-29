@@ -45,8 +45,8 @@ type ShardSpec struct {
 
 // ReplicationConfig holds replication tuning parameters.
 type ReplicationConfig struct {
-	QuorumTimeoutMs    int `yaml:"quorum_timeout_ms"`
-	MaxLagVersions     int `yaml:"max_lag_versions"`
+	QuorumTimeoutMs     int `yaml:"quorum_timeout_ms"`
+	MaxLagVersions      int `yaml:"max_lag_versions"`
 	MaxBufferedVersions int `yaml:"max_buffered_versions"`
 }
 
@@ -165,6 +165,8 @@ type NodeConfig struct {
 	QuorumTimeoutMs int           `yaml:"quorum_timeout_ms"`
 	// How many writes between WAL snapshots (0 = use default of 100)
 	SnapshotInterval int `yaml:"snapshot_interval"`
+	// How many snapshots to retain on disk (rotation). Must be > 0.
+	SnapshotRetention int `yaml:"snapshot_retention"`
 	// Maximum number of entries retained in the in-memory replication log.
 	// Followers that lag by more than this many writes receive a full snapshot.
 	// 0 means use the default of 1000.
@@ -216,6 +218,12 @@ func (c *NodeConfig) applyDefaults() {
 	if c.QuorumTimeout == 0 {
 		c.QuorumTimeout = time.Duration(c.QuorumTimeoutMs) * time.Millisecond
 	}
+	if c.SnapshotInterval == 0 {
+		c.SnapshotInterval = 100
+	}
+	if c.SnapshotRetention == 0 {
+		c.SnapshotRetention = 2
+	}
 	if c.ReplicationLogSize == 0 {
 		c.ReplicationLogSize = 1000
 	}
@@ -249,6 +257,12 @@ func (c *NodeConfig) validate() error {
 	}
 	if c.CoordinatorAddress == "" {
 		return fmt.Errorf("coordinator_address is required")
+	}
+	if c.SnapshotInterval < 0 {
+		return fmt.Errorf("snapshot_interval must be >= 0")
+	}
+	if c.SnapshotRetention < 0 {
+		return fmt.Errorf("snapshot_retention must be >= 0")
 	}
 	return nil
 }

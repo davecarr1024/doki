@@ -11,8 +11,6 @@ import (
 	"github.com/davecarr1024/doki/internal/wal"
 )
 
-const defaultSnapshotInterval = 100
-
 // diskState manages the WAL and snapshot file for a single shard replica.
 //
 // Write flow (leader or follower):
@@ -21,7 +19,7 @@ const defaultSnapshotInterval = 100
 //  3. maybeSnapshot(...)  — take snapshot + truncate WAL every N writes
 //
 // Startup flow:
-//  1. openDiskState(dir)  — opens or creates the shard directory + WAL file
+//  1. openDiskState(dir, interval, retention) — opens or creates the shard directory + WAL file
 //  2. load()              — reads snapshot then replays WAL entries on top
 //  3. InitShards applies the loadResult to the in-memory replica
 type diskState struct {
@@ -31,6 +29,7 @@ type diskState struct {
 	snapshotPath        string
 	writesSinceSnapshot int
 	snapshotInterval    int
+	snapshotRetention   int
 }
 
 // diskLoadResult holds the state recovered from disk.
@@ -43,13 +42,16 @@ type diskLoadResult struct {
 
 // openDiskState creates or opens the on-disk state for a shard.
 // dir is created if it does not exist. snapshotInterval controls how often
-// a snapshot is taken; pass 0 to use the default (100 writes).
-func openDiskState(dir string, snapshotInterval int) (*diskState, error) {
+// a snapshot is taken; snapshotRetention controls how many snapshots to keep.
+func openDiskState(dir string, snapshotInterval, snapshotRetention int) (*diskState, error) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return nil, fmt.Errorf("create shard dir %q: %w", dir, err)
 	}
 	if snapshotInterval <= 0 {
-		snapshotInterval = defaultSnapshotInterval
+		return nil, fmt.Errorf("snapshot interval must be > 0")
+	}
+	if snapshotRetention <= 0 {
+		return nil, fmt.Errorf("snapshot retention must be > 0")
 	}
 	walPath := filepath.Join(dir, "wal.jsonl")
 	w, err := wal.Open(walPath)
@@ -57,10 +59,11 @@ func openDiskState(dir string, snapshotInterval int) (*diskState, error) {
 		return nil, fmt.Errorf("open wal: %w", err)
 	}
 	return &diskState{
-		walFile:          w,
-		walPath:          walPath,
-		snapshotPath:     filepath.Join(dir, "snapshot.json"),
-		snapshotInterval: snapshotInterval,
+		walFile:           w,
+		walPath:           walPath,
+		snapshotPath:      filepath.Join(dir, "snapshot.json"),
+		snapshotInterval:  snapshotInterval,
+		snapshotRetention: snapshotRetention,
 	}, nil
 }
 
@@ -72,10 +75,10 @@ func openDiskState(dir string, snapshotInterval int) (*diskState, error) {
 // If the snapshot is corrupt, load falls back to no-disk-state so the caller
 // will request a fresh snapshot from the leader.
 func (ds *diskState) load() (diskLoadResult, error) {
-	snap, snapExists, err := snapshot.Load(ds.snapshotPath)
+	snap, snapPath, snapExists, err := loadLatestSnapshot(ds.snapshotPath, ds.snapshotRetention)
 	if err != nil {
 		// Corrupt snapshot — treat as no disk state.
-		log.Printf("diskstate: corrupt snapshot path=%s err=%v — will recover from leader", ds.snapshotPath, err)
+		log.Printf("diskstate: snapshot load failed path=%s err=%v — will recover from leader", snapPath, err)
 		return diskLoadResult{}, nil
 	}
 
@@ -120,8 +123,40 @@ func (ds *diskState) load() (diskLoadResult, error) {
 		}
 	}
 
-	log.Printf("diskstate: loaded path=%s version=%d term=%d keys=%d", ds.snapshotPath, version, term, len(kv))
+	if snapExists {
+		log.Printf("diskstate: loaded path=%s version=%d term=%d keys=%d", snapPath, version, term, len(kv))
+	}
 	return diskLoadResult{Term: term, Version: version, KV: kv, Valid: true}, nil
+}
+
+func loadLatestSnapshot(basePath string, retention int) (snapshot.Snapshot, string, bool, error) {
+	var best snapshot.Snapshot
+	bestPath := basePath
+	found := false
+	for i := 0; i < retention; i++ {
+		path := snapshotPathFor(basePath, i)
+		snap, exists, err := snapshot.Load(path)
+		if err != nil {
+			log.Printf("diskstate: snapshot load failed path=%s err=%v", path, err)
+			continue
+		}
+		if !exists {
+			continue
+		}
+		if !found || snap.Version > best.Version {
+			best = snap
+			bestPath = path
+			found = true
+		}
+	}
+	return best, bestPath, found, nil
+}
+
+func snapshotPathFor(basePath string, index int) string {
+	if index == 0 {
+		return basePath
+	}
+	return fmt.Sprintf("%s.%d", basePath, index)
 }
 
 func ensureMonotonicWAL(entries []wal.Entry) error {
@@ -165,6 +200,9 @@ func (ds *diskState) maybeSnapshot(term, version uint64, kvSnapshot map[string]s
 // takeSnapshot saves a full KV snapshot and truncates the WAL.
 // After this call, the WAL is empty and the snapshot file contains the full state.
 func (ds *diskState) takeSnapshot(term, version uint64, kvSnapshot map[string]string) error {
+	if err := ds.rotateSnapshots(); err != nil {
+		return err
+	}
 	snap := snapshot.Snapshot{Term: term, Version: version, KV: kvSnapshot}
 	if err := snapshot.Save(ds.snapshotPath, snap); err != nil {
 		return fmt.Errorf("save snapshot: %w", err)
@@ -182,6 +220,9 @@ func (ds *diskState) takeSnapshot(term, version uint64, kvSnapshot map[string]st
 // resetSnapshot overwrites the on-disk snapshot with the provided state and
 // truncates the WAL. Used after network recovery to align disk state with leader.
 func (ds *diskState) resetSnapshot(term, version uint64, kvSnapshot map[string]string) error {
+	if err := ds.rotateSnapshots(); err != nil {
+		return err
+	}
 	snap := snapshot.Snapshot{Term: term, Version: version, KV: kvSnapshot}
 	if err := snapshot.Save(ds.snapshotPath, snap); err != nil {
 		return fmt.Errorf("save snapshot: %w", err)
@@ -199,4 +240,28 @@ func (ds *diskState) resetSnapshot(term, version uint64, kvSnapshot map[string]s
 // close closes the underlying WAL file.
 func (ds *diskState) close() error {
 	return ds.walFile.Close()
+}
+
+func (ds *diskState) rotateSnapshots() error {
+	if ds.snapshotRetention <= 1 {
+		return nil
+	}
+	for i := ds.snapshotRetention - 1; i >= 1; i-- {
+		oldPath := snapshotPathFor(ds.snapshotPath, i)
+		newPath := snapshotPathFor(ds.snapshotPath, i+1)
+		if i == ds.snapshotRetention-1 {
+			_ = os.Remove(newPath)
+		}
+		if _, err := os.Stat(oldPath); err == nil {
+			if err := os.Rename(oldPath, newPath); err != nil {
+				return fmt.Errorf("rotate snapshot: %w", err)
+			}
+		}
+	}
+	if _, err := os.Stat(ds.snapshotPath); err == nil {
+		if err := os.Rename(ds.snapshotPath, snapshotPathFor(ds.snapshotPath, 1)); err != nil {
+			return fmt.Errorf("rotate snapshot: %w", err)
+		}
+	}
+	return nil
 }
