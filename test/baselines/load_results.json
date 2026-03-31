@@ -22,5 +22,29 @@
     "p50_ms": 32.387622,
     "p99_ms": 58.483141,
     "success_rate_pct": 100
+  },
+  {
+    "test_name": "baseline_throughput",
+    "recorded_at": "2026-03-31T19:14:17.989293268Z",
+    "throughput_wps": 641.0354208097268,
+    "p50_ms": 7.537014,
+    "p99_ms": 16.810518,
+    "success_rate_pct": 100
+  },
+  {
+    "test_name": "load_under_leader_failure",
+    "recorded_at": "2026-03-31T19:14:34.200475617Z",
+    "throughput_wps": 586.0519511490077,
+    "p50_ms": 4.088799,
+    "p99_ms": 11.240158000000001,
+    "success_rate_pct": 99.98863765481195
+  },
+  {
+    "test_name": "high_concurrency_20_writers",
+    "recorded_at": "2026-03-31T19:14:45.145742621Z",
+    "throughput_wps": 625.0151832786717,
+    "p50_ms": 31.150337999999998,
+    "p99_ms": 50.192302,
+    "success_rate_pct": 100
   }
 ]
